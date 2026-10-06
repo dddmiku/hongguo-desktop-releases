@@ -51,6 +51,14 @@ def register(app):
         A.clear_session()
         return {"loggedIn": False}
 
+    @app.post("/desktop/account/sync_emulator")
+    def desktop_account_sync_emulator():
+        """从已登录的模拟器同步登录态（验证码登录不可用时的备用路径）。"""
+        result = A.sync_from_emulator()
+        if not result.get("ok"):
+            raise HTTPException(400, str(result.get("error") or "同步失败"))
+        return result.get("session") or {}
+
     @app.get("/desktop/account/remote")
     def desktop_account_remote(limit: int = Query(30, ge=1, le=200)):
         history = A.remote_history(limit=limit)

@@ -379,7 +379,14 @@ def _call(method, path, body=None, extra=None, session=None, host=None, form=Non
         #   2) 必须带 x-ss-req-ticket（毫秒时间戳），否则同样退化成 error_code=7
         #   3) 请求体必须带 x-ss-stub（登录/发码都是表单，所以是真机那种 32 位大写十六进制）
         # 只补 1+2 仍然失败；补上 3 后服务端才放行（错误码从 7 变成「验证码错误/过期」）。
+        #
+        # 头部要与模拟器逐项对齐：补 lc / x-vc-bdturing-sdk-version，
+        # 并去掉内容接口那套 x-tt-store-region / x-tt-store-region-src（护照请求不带）。
+        for stale in ("x-tt-store-region", "x-tt-store-region-src"):
+            headers.pop(stale, None)
         headers["user-agent"] = PASSPORT_UA
+        headers["lc"] = "101"
+        headers["x-vc-bdturing-sdk-version"] = "4.0.3.cn"
         headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
         if data is not None:
             headers["x-ss-stub"] = hashlib.md5(data).hexdigest().upper()
@@ -664,3 +671,99 @@ def remote_favorites():
             "addedAt": int(it.get("collect_time") or it.get("modify_time") or 0),
         })
     return {"ok": True, "items": items}
+
+# ---- 从模拟器同步登录态 ---------------------------------------------------
+def _adb():
+    import subprocess
+    adb = os.environ.get("ADB", r"D:\Tools\adb\adb.exe")
+    dev = os.environ.get("ADB_DEVICE", "127.0.0.1:16448")
+    return adb, dev
+
+
+def _adb_shell(cmd, timeout=25):
+    import subprocess
+    adb, dev = _adb()
+    try:
+        out = subprocess.run([adb, "-s", dev, "shell", cmd],
+                             capture_output=True, timeout=timeout)
+    except Exception:
+        return ""
+    return out.stdout.decode("utf-8", "replace")
+
+
+def sync_from_emulator():
+    """在模拟器里已登录的前提下，把该会话同步到桌面端。
+
+    只读 App 自己的会话数据（不改动 App、不注入进程）。
+    """
+    pkg = "com.phoenix.read"
+    prefs = "/data/data/%s/shared_prefs" % pkg
+
+    token = ""
+    cookie = ""
+
+    # 1) 会话数据可能落在若干 prefs 文件里，逐个找
+    names = _adb_shell("ls %s 2>/dev/null" % prefs).split()
+    for name in names:
+        if not name.endswith(".xml"):
+            continue
+        low = name.lower()
+        if not any(k in low for k in ("account", "passport", "session", "token",
+                                      "login", "cookie", "sid", "user")):
+            continue
+        body = _adb_shell("cat %s/%s" % (prefs, name))
+        if not body:
+            continue
+        if not token:
+            for pat in (r'name="x-tt-token"[^>]*>([^<]+)<',
+                        r'name="x_tt_token"[^>]*>([^<]+)<',
+                        r'name="token"[^>]*>([^<]+)<'):
+                m = re.search(pat, body)
+                if m and len(m.group(1)) > 40:
+                    token = m.group(1).strip()
+                    break
+        if not cookie:
+            m = re.search(r'name="[^"]*cookie[^"]*"[^>]*>([^<]{40,})<', body, re.I)
+            if m:
+                cookie = m.group(1).strip()
+
+    # 2) WebView 的 Cookie 持久化库（SQLite）：直接读字节再本地匹配，
+    #    避免在 shell 里拼正则。
+    if not cookie:
+        import re as _re
+        for cand in ("%s/../app_webview/Default/Cookies" % prefs,
+                     "%s/../app_webview/Cookies" % prefs):
+            blob = _adb_shell("cat %s 2>/dev/null" % cand, timeout=30)
+            if not blob:
+                continue
+            m = _re.search(r"sessionid=([0-9a-f]{32})", blob)
+            if m:
+                sid = m.group(1)
+                cookie = "sessionid=%s; sessionid_ss=%s; sid_tt=%s" % (sid, sid, sid)
+                break
+
+    if not (token or cookie):
+        return {"ok": False, "error": "模拟器里没有可用的登录态；请先在模拟器里登录一次"}
+
+    session = load_session() or {}
+    if token:
+        session["token"] = token
+    if cookie:
+        session["cookie"] = cookie
+    session["saved_at"] = int(time.time())
+    session["source"] = "emulator"
+    save_session(session)
+
+    # 立刻验一次，确认真的能用
+    info = _json(_call("GET", "/reading/user/info/v", session=session))
+    data = info.get("data") if isinstance(info.get("data"), dict) else {}
+    if info.get("code") in (0, "0") and data:
+        session["user_name"] = data.get("user_name") or ""
+        session["uid"] = str(data.get("user_id") or "")
+        save_session(session)
+        log_event("sync_from_emulator", ok=True, has_token=bool(token),
+                  has_cookie=bool(cookie), user=bool(session["user_name"]))
+        return {"ok": True, "session": public_session(session)}
+    log_event("sync_from_emulator", ok=False, has_token=bool(token),
+              has_cookie=bool(cookie), code=info.get("code"))
+    return {"ok": False, "error": "同步到的登录态无效，请在模拟器里重新登录"}

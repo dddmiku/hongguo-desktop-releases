@@ -45,6 +45,38 @@ async function hqApiAlive(){const v=hqApi();if(!v)return!1;
 try{const r=await fetch(v.origin+"/desktop/account/status",
 {method:"GET",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error",
 signal:AbortSignal.timeout(4000)});return r.ok}catch(e){return!1}}
+
+// 手机端历史/收藏：拉回来后并入本机片单。
+// 上游的「观看历史」页只读本机 localStorage，手机端记录一直没被读取，
+// 所以这里主动拉 /desktop/account/remote 并合并（按 seriesId 去重）。
+function hqRemoteLibrary(){
+return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)}
+async function hqMergeLibrary(localFav,localHist,setFav,setHist){
+try{
+const r=await hqRemoteLibrary();if(!r)return;
+if(r.favoritesOk&&Array.isArray(r.favorites)&&r.favorites.length){
+const seen=new Set((localFav||[]).map(function(x){return String(x.seriesId)}));
+const merged=(localFav||[]).slice();
+r.favorites.forEach(function(f){const id=String(f.seriesId||"");
+if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:"",cover:"",fromPhone:!0})}});
+if(merged.length!==(localFav||[]).length)setFav(merged)}
+if(r.historyOk&&Array.isArray(r.history)&&r.history.length){
+const seen=new Set((localHist||[]).map(function(x){return String(x.seriesId)}));
+const merged=(localHist||[]).slice();
+r.history.forEach(function(h){const id=String(h.seriesId||"");
+if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:h.title||"",
+cover:h.cover||"",lastEpisode:Number(h.episode)||1,
+episodeCount:Number(h.total)||0,fromPhone:!0})}});
+if(merged.length!==(localHist||[]).length)setHist(merged)}
+}catch(e){}}
+
+// 账号页确认「本机 API 已连通」后，补一次合并。
+// 打开应用时的首次合并可能还没有凭据（凭据要播放过一集才下发），
+// 这里等凭据到位后再合并一次，保证手机端历史/收藏一定进得来。
+var hqMergedOnce=!1;
+function hqMergeOnce(){if(hqMergedOnce)return;const w=window.__hqLib;
+if(!w||!w.setFav||!w.setHist)return;hqMergedOnce=!0;
+return hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist)}
 '''
 
 PANEL = r"""
@@ -56,7 +88,7 @@ async function load(){
 const alive=await hqApiAlive();
 if(!alive){hqForgetApi();if(x){a({loggedIn:!1});v(hqNeedPlayHint),T("")}return!1}
 const A=await hqAcctCall("/desktop/account/status",null,"GET",null);
-if(x&&A){a(A);v(""),T("")}return!0}
+if(x&&A){a(A);v(""),T("");hqMergeOnce()}return!0}
 (async()=>{
 if(await load())return;
 // 凭据只在播放时下发。这里自动等：窗口重新获得焦点或每 3 秒重试一次，
@@ -213,10 +245,11 @@ def patch(text):
         s,
         re.escape('a==="account"?b.jsx(aM,{status:Ti,qrLogin:on,busy:Cs,message:Dn,onRefresh:yr,'
                   'onStartLogin:()=>void uo(),onLogout:()=>void co()}):'),
-        'a==="account"?b.jsxs(b.Fragment,{children:[b.jsx(aM,{status:Ti,qrLogin:on,busy:Cs,'
-        'message:Dn,onRefresh:yr,onStartLogin:()=>void uo(),onLogout:()=>void co()}),'
-        'b.jsx(hqAccountPanel,{})]}):',
-        "账号页面板")
+        # 上游那个账号面板是「接入你们自己的 OAuth 设备码服务」的占位实现，
+        # 未配置时整页都在提示 HONGGUO_DESKTOP_AUTH_* 环境变量，对红果账号没有任何用处。
+        # 这里直接换成我们自己的验证码登录面板。
+        'a==="account"?b.jsx(hqAccountPanel,{}):',
+        "账号页换成验证码面板")
 
     # 6) 侧栏「账号」入口：始终可见。
     # 之前依赖「已配置 or 有本机凭据」，而凭据会被清掉（应用重启后失效），
@@ -234,5 +267,17 @@ def patch(text):
         raise Fail("[FAIL] 未找到账号面板组件")
     s = s[:m.start()] + panel + "\n" + s[m.start():]
     log.append("OK   注入验证码登录面板")
+
+    # 8) 手机端历史/收藏并入本机片单
+    # 上游那行是「加载完本地片单后 setFavorites/setHistory/setReady/setError」，
+    # 变量名每次都变，所以用探针抓出「setter(值)」这四对，再在末尾插合并调用。
+    s = _sub_once(
+        s,
+        r'([\w$]+)\((\w+)\),([\w$]+)\((\w+)\),([\w$]+)\(!0\),([\w$]+)\(""\),!0\)\}catch\(',
+        r'\g<1>(\g<2>),\g<3>(\g<4>),\g<5>(!0),\g<6>(""),'
+        # 把片单的 setter 挂到 window，供账号页在拿到凭据后重新触发合并。
+        r'window.__hqLib={fav:\g<2>,hist:\g<4>,setFav:\g<1>,setHist:\g<3>},'
+        r'hqMergeLibrary(\g<2>,\g<4>,\g<1>,\g<3>),!0)}catch(',
+        "手机端历史/收藏合并")
 
     return s, log
