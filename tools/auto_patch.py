@@ -101,6 +101,95 @@ def backup_once(exe, backend):
     print("[OK] 已保存原始备份到", BACKUP)
 
 
+def patch_live_backend(backend):
+    """在安装目录的后端上直接打补丁（而不是拿仓库里的旧基线覆盖）。
+
+    上游发新版时后端文件会一起更新。若用 base/backend（旧版本）去覆盖，
+    等于把后端降级，新版改动会丢失。所以这里：
+      1. 先给当前文件留一份 .orig-<哈希> 备份，便于回滚；
+      2. 用「上游原版」身份对现有文件套补丁。
+
+    返回 (patched, skipped, failed) 三个列表。
+    """
+    staging = os.path.join(ROOT, "_work", "live")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+
+    # 已打补丁的判据：这些标记任一存在即认为该文件已处理过
+    MARKERS = {
+        "desktop_hls.py": ("_hq_copy_hls",),
+        "desktop_hls_service.py": ("normalize_desktop_quality",),
+        "server.py": ("encode_h264(decrypted",),
+        "desktop_encode.py": ("cancelled is not None and cancelled()",),
+    }
+
+    patched, skipped, failed = [], [], []
+    for name in PATCHED_FILES:
+        live = os.path.join(backend, name)
+        if not os.path.isfile(live):
+            failed.append((name, "文件不存在"))
+            continue
+
+        current = io.open(live, encoding="utf-8").read()
+        if any(m in current for m in MARKERS[name]):
+            skipped.append(name)
+            continue
+
+        # 1) 备份当前（上游新版）内容，名字带哈希，避免覆盖旧备份
+        keep = live + ".orig-" + sha(live)[:12]
+        if not os.path.isfile(keep):
+            shutil.copy2(live, keep)
+
+        # 2) 把当前内容放到暂存目录，按「上游原版」套补丁
+        stage = os.path.join(staging, name)
+        shutil.copy2(live, stage)
+        before = sha(stage)
+
+        try:
+            if name == "desktop_hls.py":
+                patch_backend.patch_hls(staging, staging)
+            elif name == "desktop_hls_service.py":
+                patch_backend.patch_service(staging, staging)
+            elif name == "server.py":
+                patch_backend.patch_server(staging, staging)
+            elif name == "desktop_encode.py":
+                patch_backend.patch_encode(staging, staging)
+        except SystemExit as exc:
+            failed.append((name, str(exc)))
+            continue
+
+        # 3) 只有确认产出真的变化了才写回，避免把空结果覆盖上去
+        if sha(stage) == before:
+            failed.append((name, "补丁未产生变化（可能上游结构已变）"))
+            continue
+        shutil.copy2(stage, live)
+        patched.append(name)
+    return patched, skipped, failed
+
+
+def repair_backend():
+    """校验并修复安装目录的后端补丁（幂等，随时可跑）。"""
+    if not os.path.isdir(BACKEND):
+        print("[FAIL] 找不到后端目录:", BACKEND)
+        return 1
+    patched, skipped, failed = patch_live_backend(BACKEND)
+    for name in patched:
+        print("   [OK] 后端已注入", name)
+    for name in skipped:
+        print("   [=] 后端已含补丁，跳过", name)
+    for name, why in failed:
+        print("   [!] 后端未注入", name, "-", why)
+
+    # 清掉 pyc，避免加载到旧字节码
+    import glob as _glob
+    for pyc in _glob.glob(os.path.join(BACKEND, "__pycache__", "*.pyc")):
+        try:
+            os.remove(pyc)
+        except OSError:
+            pass
+    return 0 if not failed else 1
+
+
 def apply_patches():
     if not os.path.isfile(EXE):
         print("[FAIL] 找不到 exe:", EXE)
@@ -108,15 +197,19 @@ def apply_patches():
 
     st = load_state()
     cur = sha(EXE)
+
+    # exe 已是补丁版且记录一致：仍然校验后端（上游更新可能只换后端）
     if st.get("patched_exe_sha256") == cur and is_patched(EXE):
-        print("[=] 当前已是补丁版本，无需处理")
-        return 0
+        print("[=] exe 已是补丁版，检查后端…")
+        rc = repair_backend()
+        print("[OK] 无需处理" if rc == 0 else "[!] 后端存在未注入项")
+        return rc
 
     if is_patched(EXE):
         st["patched_exe_sha256"] = cur
         save_state(st)
-        print("[=] exe 已含补丁，仅更新记录")
-        return 0
+        print("[=] exe 已含补丁，仅更新记录；检查后端…")
+        return repair_backend()
 
     print("[*] 检测到未打补丁的 exe，开始重新注入…")
     backup_once(EXE, BACKEND)
@@ -160,30 +253,8 @@ def apply_patches():
     tmp_exe = EXE + ".patched"
     a2.save(tmp_exe)
 
-    # 4) 后端补丁
-    # 后端补丁以上游原始副本为输入（仓库内 base/backend，可随版本更新）。
-    up_backend = os.path.join(ROOT, "base", "backend")
-    if not os.path.isdir(up_backend):
-        print("   [!] 缺少 base/backend 上游副本，跳过后端补丁")
-    else:
-        for name in PATCHED_FILES:
-            patch_backend.patch_hls(up_backend, BACKEND) if name == "desktop_hls.py" else None
-            patch_backend.patch_service(up_backend, BACKEND) if name == "desktop_hls_service.py" else None
-            patch_backend.patch_server(up_backend, BACKEND) if name == "server.py" else None
-            patch_backend.patch_encode(up_backend, BACKEND) if name == "desktop_encode.py" else None
-        # 其余后端文件（未打补丁的）从上游副本补齐，避免版本混杂
-        for name in os.listdir(up_backend):
-            if name.endswith(".py") or name.endswith(".txt"):
-                dst = os.path.join(BACKEND, name)
-                if not os.path.isfile(dst):
-                    io.open(dst, "w", encoding="utf-8", newline="").write(
-                        io.open(os.path.join(up_backend, name), encoding="utf-8").read())
-        import glob as _glob
-        for pyc in _glob.glob(os.path.join(BACKEND, "__pycache__", "*.pyc")):
-            try:
-                os.remove(pyc)
-            except OSError:
-                pass
+    # 4) 后端补丁：在安装目录的现有文件上直接打
+    repair_backend()
 
     # 5) 原子替换 exe（需要应用已退出）
     try:
