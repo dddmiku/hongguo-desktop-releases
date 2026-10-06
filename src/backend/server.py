@@ -27,10 +27,37 @@ import offline_decrypt as OD
 import offline_dl as ODL
 
 STREAM_CACHE = os.environ.get("HONGGUO_STREAM_CACHE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads", ".stream_cache")
+# 本地维护: 有界 LRU。原先每集每档位建一个锁且永不回收，
+# 长跑后无界增长。这里最多保留 256 个，超出即淘汰最久未用的。
 _dec_locks = {}; _dec_guard = threading.Lock()
+_HQ_DEC_LOCKS_MAX = 256
 def _dec_lock(key):
     with _dec_guard:
-        return _dec_locks.setdefault(key, threading.Lock())
+        lock = _dec_locks.pop(key, None)
+        if lock is None:
+            lock = threading.Lock()
+        _dec_locks[key] = lock          # 重新插入到末尾 = 最近使用
+        while len(_dec_locks) > _HQ_DEC_LOCKS_MAX:
+            _dec_locks.pop(next(iter(_dec_locks)))
+        return lock
+
+def _hq_cache_path(vid, safe_q):
+    """把 vid + 档位解析成缓存文件路径，并强制它落在 STREAM_CACHE 之内。
+
+    为什么必须有这一层：/stream 的 vid 完全来自调用方，而 os.path.join
+    在 Windows 上遇到绝对路径会丢弃前缀，
+    vid="C:/.../x" 就能让 out 指到缓存目录之外。
+    实测（2026-10-07）可读到本机任意 mp4 文件。
+    这里要求 vid 是纯数字集号，再对最终路径做 realpath 包含校验，双保险。
+    """
+    text = str(vid or "")
+    if not re.fullmatch(r"[0-9]{1,32}", text):
+        raise HTTPException(400, "Invalid media id")
+    root = os.path.realpath(STREAM_CACHE)
+    out = os.path.realpath(os.path.join(root, f"{text}_{safe_q}.mp4"))
+    if out != root and not out.startswith(root + os.sep):
+        raise HTTPException(400, "Cache path escapes stream cache")
+    return out
 
 def _vm_track(vid, quality="best"):
     """取该集指定清晰度的 (main_url, spade_a, encrypt, definition, size)。"""
@@ -51,7 +78,7 @@ def _ensure_decrypted(vid, quality="best"):
     """下载 CDN 密文 + 纯离线解密, 返回缓存的明文 mp4 路径(已缓存则直接返回)。"""
     os.makedirs(STREAM_CACHE, exist_ok=True)
     safe_q = re.sub(r"[^\w]", "", str(quality)) or "best"
-    out = os.path.join(STREAM_CACHE, f"{vid}_{safe_q}.mp4")
+    out = _hq_cache_path(vid, safe_q)
     if os.path.exists(out) and os.path.getsize(out) > 0:
         return out
     # offline_decrypt() falls back to a `.raw.mp4` path when ffmpeg is not
@@ -101,7 +128,15 @@ try:
     _IMG_OK = True
 except Exception:
     _IMG_OK = False
-_img_cache = {}
+# 本地维护: 有界封面缓存。原先是无上限 dict，长跑只增不减。
+_img_cache = {}; _HQ_IMG_CACHE_MAX = 512
+
+
+def _hq_img_cache_put(url, data):
+    """写入封面缓存；超出上限就丢弃最旧的条目。"""
+    _img_cache[url] = data
+    while len(_img_cache) > _HQ_IMG_CACHE_MAX:
+        _img_cache.pop(next(iter(_img_cache)), None)
 _IMG_HOSTS = ("fqnovelpic.com", "byteimg.com", "qznovelvod.com", "douyinpic.com", "pstatp.com")
 
 # ---- 鉴权(强制) + 限流 + 密钥管理 ----
@@ -119,7 +154,9 @@ _rl = {}
 _rl_lock = threading.Lock()
 
 # 免鉴权路径: 首页/网页/封面图/文档/管理页(管理页自己用 ADMIN_TOKEN 校验)
-_EXEMPT = ("/", "/ui", "/img", "/docs", "/openapi.json", "/redoc", "/favicon.ico")
+# 本地维护: 去掉 /docs、/openapi.json、/redoc ——
+# 它们免鉴权却泄漏完整路由与参数清单，而前端一处都没用到。
+_EXEMPT = ("/", "/ui", "/img", "/favicon.ico")
 _ADMIN_PREFIX = "/admin"
 
 
@@ -134,7 +171,19 @@ async def auth_mw(request: Request, call_next):
     if path == "/stats" or path.startswith(_ADMIN_PREFIX):
         # 管理/统计: 由各自处理器用 ADMIN_TOKEN 校验
         pass
-    elif path not in _EXEMPT:
+    elif path in _EXEMPT:
+        # 本地维护: 免鉴权路径也要限流。
+        # /img 必须免鉴权（<img> 标签带不了请求头），但之前连限流
+        # 也绕过了，本机任意进程能拿它当无限图片代理。
+        _now = time.time()
+        with _rl_lock:
+            _bucket = _rl.setdefault(("hq_exempt", path), [])
+            while _bucket and _bucket[0] < _now - 60:
+                _bucket.pop(0)
+            if len(_bucket) >= 120:
+                return JSONResponse({"detail": "超过限流 120/分钟"}, status_code=429)
+            _bucket.append(_now)
+    else:
         key = request.headers.get("x-api-key") or request.query_params.get("api_key") or ""
         if not _keys.is_valid(key):            # 强制: 必须有效密钥
             _stats["auth_fail"] += 1
@@ -156,8 +205,14 @@ async def auth_mw(request: Request, call_next):
     return resp
 
 
+# 本地维护: 单次展开的集数上限。上游 /episodes 返回的集数可被构造得很大，
+# 无上界时 parse_range 会一次性建出百万级列表并把上游拖死。
+_HQ_RANGE_MAX = 2000
+
+
 def parse_range(ep, total):
     """'1' / '1-10' / 'all' -> 集号列表"""
+    total = min(int(total or 0), _HQ_RANGE_MAX)
     if not ep or ep == "all":
         return list(range(1, total + 1))
     m = re.match(r"(\d+)-(\d+)$", ep)
@@ -208,6 +263,36 @@ def ui():
     return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html"))
 
 
+def _hq_host_allowed(host, hosts):
+    """域名白名单判定。必须带前导点，否则 evilfqnovelpic.com 会被放行。"""
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def _hq_img_fetch(url, hosts, max_hops=3):
+    """取封面图，手动跟随重定向，且每一跳都重新校验域名。
+
+    requests 默认自动跟随 302，若允许域名上存在开放重定向，
+    就能把请求打到任意 host —— 等于绕过 _IMG_HOSTS 白名单（SSRF）。
+    这里显式禁止自动跟随，逐跳校验 Location。
+    """
+    from urllib.parse import urlparse, urljoin
+    current = url
+    for _ in range(max_hops + 1):
+        u = urlparse(current)
+        if u.scheme not in ("http", "https") or not _hq_host_allowed(u.hostname, hosts):
+            raise HTTPException(400, "图片域名不允许")
+        r = requests.get(current, timeout=30, verify=True, allow_redirects=False,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code not in (301, 302, 303, 307, 308):
+            return r
+        loc = r.headers.get("location") or ""
+        if not loc:
+            return r
+        current = urljoin(current, loc)
+    raise HTTPException(400, "图片重定向过多")
+
+
 @app.get("/img")
 def api_img(url: str):
     """图片代理。红果封面常返回 HEIC，浏览器不支持时转成 JPEG。"""
@@ -222,7 +307,7 @@ def api_img(url: str):
         cached = _img_cache.get(raw)
         if cached is not None:
             return Response(cached, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
-        r = requests.get(raw, timeout=30, verify=True, headers={"User-Agent": "Mozilla/5.0"})
+        r = _hq_img_fetch(raw, _IMG_HOSTS)
         r.raise_for_status()
         content_type = (r.headers.get("content-type") or "").lower()
         data = r.content
@@ -233,7 +318,7 @@ def api_img(url: str):
             out = io.BytesIO()
             img.save(out, format="JPEG", quality=88, optimize=True)
             data = out.getvalue()
-            _img_cache[raw] = data
+            _hq_img_cache_put(raw, data)
             return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
         return Response(data, media_type=content_type or "image/jpeg", headers={"Cache-Control": "max-age=86400"})
     except HTTPException:
@@ -280,28 +365,6 @@ def admin_delete_key(request: Request, key: str):
     if not _check_admin(request):
         raise HTTPException(401, "admin_token 无效")
     return {"ok": _keys.delete(key)}
-
-
-@app.get("/img")
-def img(url: str):
-    """封面图代理: 拉取并把HEIC转JPEG(浏览器不支持HEIC)。仅限字节图片域名。"""
-    from urllib.parse import urlparse
-    host = urlparse(url).hostname or ""
-    if not any(host.endswith(h) for h in _IMG_HOSTS):
-        raise HTTPException(400, "host not allowed")
-    if url in _img_cache:
-        return Response(_img_cache[url], media_type="image/jpeg",
-                        headers={"Cache-Control": "max-age=86400"})
-    try:
-        raw = requests.get(url, timeout=20, verify=True).content
-        if _IMG_OK:
-            im = Image.open(io.BytesIO(raw)).convert("RGB")
-            buf = io.BytesIO(); im.save(buf, "JPEG", quality=82); raw = buf.getvalue()
-        if len(_img_cache) < 1000:
-            _img_cache[url] = raw
-        return Response(raw, media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
-    except Exception as e:
-        raise HTTPException(404, str(e))
 
 
 from search_pages import SearchPager
@@ -402,6 +465,9 @@ def api_browse(genre: str = "ai_series", theme: str = None, setting: str = None,
 
 @app.get("/episodes")
 def api_episodes(series_id: str):
+    # 本地维护: 与其它路由一致的剧号校验，避免把任意串透给上游。
+    if not re.fullmatch(r"[0-9]{8,24}", str(series_id or "")):
+        raise HTTPException(400, "Invalid series id")
     try:
         meta, eps = H.get_episodes(series_id)
         return {"meta": meta, "episodes": eps}
@@ -716,6 +782,106 @@ def desktop_cleanup(series_id: str, ep: int):
     if not re.fullmatch(r"[0-9]{8,24}", str(series_id)) or not 1 <= ep <= 100000:
         raise HTTPException(400, "Invalid episode identity")
     return {"removed": _hq_cleanup_episode(series_id, ep)}
+
+
+def _hq_sweep_partial(max_age=900):
+    """清掉转码/下载中途留下的孤儿文件。
+
+    2026-10-07 实测：stream-cache 里积了 2 个 *.partial 共 71.5 MB。
+    它们由 desktop_encode / desktop_remux 在异常退出时留下，
+    而 _hq_cleanup_episode 只匹配 `*.mp4`、_hq_cache_cap 也只 glob `*.mp4`，
+    所以这两个函数都碰不到它们 —— 属于永久泄漏。
+    这里按 mtime 清理「超过 max_age 秒没被碰过」的 .partial / .part / .raw.mp4：
+    正在写的文件 mtime 是新的，不会被误删。
+    """
+    import glob as _g
+    removed = 0
+    now = time.time()
+    for pattern in ("*.partial", "*.part", "*.raw.mp4"):
+        for path in _g.glob(os.path.join(STREAM_CACHE, pattern)):
+            try:
+                if not os.path.isfile(path):
+                    continue
+                if now - os.path.getmtime(path) < max_age:
+                    continue
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def _hq_prune_poster_cache(keep_files=400, max_age_days=14):
+    """封面缓存（poster-cache-v1）没有上游清理逻辑，只写不清。
+
+    2026-10-07 实测：624 个文件 / 113 MB，单日新增 333 个。
+    目录由 Rust 侧写入（文件名形如 <seriesId>.cover），后端不参与写入，
+    所以这里只做「按 mtime 淘汰」：先按年龄删，再按数量上限删。
+    只删普通文件、只认 .cover 后缀，不碰目录。
+    """
+    import glob as _g
+    root = os.environ.get("HONGGUO_POSTER_CACHE") or os.path.join(
+        os.environ.get("HONGGUO_BACKEND_DATA_DIR") or "", "poster-cache-v1")
+    if not root or not os.path.isdir(root):
+        return 0
+    removed = 0
+    now = time.time()
+    entries = []
+    for path in _g.glob(os.path.join(root, "*.cover")):
+        try:
+            if not os.path.isfile(path):
+                continue
+            mtime = os.path.getmtime(path)
+            entries.append((mtime, os.path.getsize(path), path))
+        except OSError:
+            pass
+    if not entries:
+        return 0
+    entries.sort(reverse=True)
+    cutoff = now - max_age_days * 86400
+    for mtime, _size, path in entries:
+        if mtime >= cutoff and len(entries) - removed <= keep_files:
+            break
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+
+# ---- 本地维护: 启动时清掉「其它清理函数碰不到的」残留 ----
+# 放在文件末尾，因为上面两个函数定义在 CLEANUP_BLOCK（也在这里）。
+def _hq_startup_cache_sweep():
+    try:
+        n_partial = _hq_sweep_partial()
+    except Exception:
+        n_partial = 0
+    try:
+        n_poster = _hq_prune_poster_cache()
+    except Exception:
+        n_poster = 0
+    if n_partial or n_poster:
+        print("[server] 启动清扫: partial=%d poster=%d" % (n_partial, n_poster))
+    return n_partial + n_poster
+
+
+_hq_startup_cache_sweep()
+
+
+@app.post("/desktop/cache/prune")
+def desktop_cache_prune():
+    """播放器关闭/切集时调一次，兜住「没看完就退出」的缓存。
+
+    原先只有 onEnded 会触发清理：中途关播放器、快速切集、直接关软件
+    这三条路径都不会清，缓存就一路涨。这里提供一个显式的兜底入口，
+    按数量上限回收（保留最近的 keep_files 个），并清掉过期的 .partial。
+    """
+    keep = int(os.environ.get("HONGGUO_CACHE_KEEP_FILES") or 8)
+    removed = _hq_cache_cap(int(os.environ.get("HONGGUO_CACHE_MAX_BYTES") or 0), keep)
+    removed += _hq_sweep_partial()
+    return {"removed": removed, "keepFiles": keep}
 
 
 # ---- 本地维护: 红果账号同步（验证码登录 / 观看进度 / 收藏）----

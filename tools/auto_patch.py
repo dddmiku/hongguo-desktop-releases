@@ -46,6 +46,9 @@ TASK = "HongguoDesktopPatch"
 PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
                  "desktop_account.py", "desktop_account_api.py")
 
+# 我们新增、上游基线里没有的模块（从 patches/account/ 重建）。
+ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py")
+
 
 def sha(path):
     h = hashlib.sha256()
@@ -102,6 +105,33 @@ def backup_once(exe, backend):
     print("[OK] 已保存原始备份到", BACKUP)
 
 
+# 每个后端文件「全部补丁步骤都已完成」的判据。
+# 只有全部命中才允许跳过；否则走一遍幂等补丁流程，把缺的步骤补上。
+FULL_MARKERS = {
+    "server.py": ("encode_h264(decrypted", "_hq_cache_cap", "_hq_cleanup_episode",
+                  "_hq_parent", "Invalid search query"),
+    "desktop_hls.py": ("_hq_copy_hls",),
+    "desktop_hls_service.py": ("normalize_desktop_quality",),
+    "desktop_encode.py": ("cancelled is not None and cancelled()",),
+    "desktop_account.py": ("def sms_login",),
+    "desktop_account_api.py": ("def register",),
+}
+
+
+def _fully_patched(name, text):
+    """该文件的补丁是否已全部就位（缺任何一步都返回 False）。"""
+    marks = FULL_MARKERS.get(name)
+    if not marks:
+        return False
+    if not all(m in text for m in marks):
+        return False
+    # server.py 额外判「重复 /img 死代码已删」：只认定义次数，不认字符串，
+    # 因为弱校验那行在删掉前后都存在同名片段。
+    if name == "server.py" and text.count('@app.get("/img")') != 1:
+        return False
+    return True
+
+
 def patch_live_backend(backend):
     """在安装目录的后端上直接打补丁（而不是拿仓库里的旧基线覆盖）。
 
@@ -116,7 +146,11 @@ def patch_live_backend(backend):
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging, exist_ok=True)
 
-    # 已打补丁的判据：这些标记任一存在即认为该文件已处理过
+    # 已打补丁的判据。
+    # 这里只用于「判断是否需要走补丁流程」，不再等于「整文件跳过」：
+    # patch_backend 的每一步各自幂等，重复执行不会重复注入。
+    # 之前是整文件跳过，导致新加的补丁步骤对已打过旧补丁的安装目录永不生效
+    # （实测：安装目录 server.py 一直留着重复 /img 死代码，auto_patch 报「已打补丁」）。
     MARKERS = {
         "desktop_hls.py": ("_hq_copy_hls",),
         "desktop_hls_service.py": ("normalize_desktop_quality",),
@@ -130,11 +164,18 @@ def patch_live_backend(backend):
     for name in PATCHED_FILES:
         live = os.path.join(backend, name)
         if not os.path.isfile(live):
+            # 账号模块是我们新增的文件（不属于上游基线），上游发版后
+            # 安装目录里可能压根没有。它们由下面的 account 步骤从
+            # patches/account/ 重建，所以这里不算失败。
+            if name in ACCOUNT_FILES:
+                continue
             failed.append((name, "文件不存在"))
             continue
 
         current = io.open(live, encoding="utf-8").read()
-        if any(m in current for m in MARKERS[name]):
+        # 只跳过「补丁函数自己声明已完成全部步骤」的文件。
+        # 其它情况一律走一遍补丁流程（幂等），保证新步骤能补上。
+        if any(m in current for m in MARKERS[name]) and _fully_patched(name, current):
             skipped.append(name)
             continue
 
@@ -161,13 +202,64 @@ def patch_live_backend(backend):
             failed.append((name, str(exc)))
             continue
 
-        # 3) 只有确认产出真的变化了才写回，避免把空结果覆盖上去
+        # 3) 产出没变化有两种可能：
+        #    a) 补丁已全部就位（幂等重跑）→ 正常跳过，不是失败；
+        #    b) 上游结构变了，锚点全都没命中 → 真失败，必须报出来。
         if sha(stage) == before:
-            failed.append((name, "补丁未产生变化（可能上游结构已变）"))
+            if _fully_patched(name, io.open(stage, encoding="utf-8").read()):
+                skipped.append(name)
+            else:
+                failed.append((name, "补丁未产生变化（可能上游结构已变）"))
             continue
         shutil.copy2(stage, live)
         patched.append(name)
+
+    # 账号同步模块（desktop_account.py / desktop_account_api.py）不在上游基线里，
+    # 是我们新增的文件，patch_live_backend 的逐文件循环覆盖不到它们。
+    # 之前这里漏了这一步，导致上游一发版、安装目录换回原版后，
+    # 「账号/历史同步」整块功能永久消失，而且 auto_patch 还报「已打补丁」。
+    # 这里补上：从 patches/account/ 重建，并在 server.py 末尾注册路由（幂等）。
+    try:
+        acct_patched = _patch_account_modules(backend)
+        patched.extend(acct_patched)
+    except SystemExit as exc:
+        failed.append(("desktop_account*.py", str(exc)))
+    except Exception as exc:                       # 账号模块异常不能拖垮播放补丁
+        failed.append(("desktop_account*.py", "%s: %s" % (type(exc).__name__, exc)))
+
     return patched, skipped, failed
+
+
+def _patch_account_modules(backend):
+    """重建账号模块并注册路由；返回本次真正写过的文件名列表。
+
+    幂等：模块内容一致、server.py 已注册过时不会重复写。
+    """
+    written = []
+    for name in ACCOUNT_FILES:
+        src = os.path.join(ROOT, "patches", "account", name)
+        if not os.path.isfile(src):
+            continue
+        want = io.open(src, encoding="utf-8").read()
+        live = os.path.join(backend, name)
+        have = io.open(live, encoding="utf-8").read() if os.path.isfile(live) else None
+        if have == want:
+            continue
+        if have is not None:
+            keep = live + ".orig-" + sha(live)[:12]
+            if not os.path.isfile(keep):
+                shutil.copy2(live, keep)
+        io.open(live, "w", encoding="utf-8", newline="").write(want)
+        written.append(name)
+
+    # server.py 末尾注册路由（patch_account_backend 自带幂等判断）
+    live_server = os.path.join(backend, "server.py")
+    if os.path.isfile(live_server):
+        before = sha(live_server)
+        patch_backend.patch_account_backend(backend, backend)
+        if sha(live_server) != before:
+            written.append("server.py(注册账号路由)")
+    return written
 
 
 def repair_backend():

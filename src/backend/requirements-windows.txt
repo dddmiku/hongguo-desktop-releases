@@ -1,13 +1,16 @@
 # Windows 本机脱机直连 · Python 依赖(下载/串流最小集,推荐)
 # 装进便携 embeddable Python:  python\python.exe -m pip install -r requirements-windows.txt
-requests
-fastapi
-uvicorn[standard]
-pycryptodome
+#
+# 本地维护: 版本固定（==）以便复现构建。
+# 2026-10-07 按本机实际安装版本锁定；升级前请先跑一遍 tools/smoke_test.py。
+requests==2.34.2
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pycryptodome==3.23.0
 av==18.1.0
 
 # --- 可选:要在 /ui 里看封面缩略图(HEIC 转 JPEG)再放开下面两行 ---
-# pillow
-# pillow-heif
+# pillow==12.3.0
+# pillow-heif==1.6.0
 
 # 不需要: frida / mitmproxy / paramiko / redis (逆向/服务器阶段才用)

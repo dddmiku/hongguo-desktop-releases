@@ -82,17 +82,28 @@ return v&&v.userName?{loggedIn:!0,userName:v.userName,uid:v.uid||"",cached:!0}:{
 // 之前用户名和「从手机合并进来的历史/收藏」都没有账号标记，
 // 换号后会把上一个号的名字和记录继续显示出来（甚至可能同步过去）。
 // 这里在拿到真实账号状态时对比 uid，一旦变化就清掉上一个号的痕迹。
+//
+// 两个之前写错的地方（2026-10-07 复核发现）：
+//   1) 原来靠 `!x.fromPhone` 判断「这条是别的号带来的」——但 fromPhone 只表示
+//      「来源是手机端」，不含账号身份；而且 `if(...&&prev)` 让「首次拿到 uid」
+//      时整段清理被跳过。
+//   2) 只改 React state，__hqLib 里的快照没跟着变，下一次合并又拿旧快照算。
+// 现在改成条目级标记 fromUid：只有「不是本机原有、且 fromUid 与当前 uid 不符」
+// 的条目才丢，并且同时更新 __hqLib 与 localStorage 的缓存身份。
 function hqCachedUid(){try{return localStorage.getItem("guoban:acctUid")||""}catch(e){return ""}}
 function hqOnAccount(s){
 if(!s||!s.loggedIn)return;
 const uid=String(s.uid||"");const prev=hqCachedUid();
 if(uid&&uid!==prev){
-// 账号变了：丢掉上一个号带进来的条目，再重新合并。
 try{localStorage.setItem("guoban:acctUid",uid)}catch(e){}
 const w=window.__hqLib;
-if(w&&w.setHist&&w.setFav&&prev){
-w.setHist(function(list){return (list||[]).filter(function(x){return !x.fromPhone})});
-w.setFav(function(list){return (list||[]).filter(function(x){return !x.fromPhone})});
+if(w&&w.setHist&&w.setFav){
+// 只丢「上一个账号带进来的」：本机自己的记录（没有 fromUid）保留。
+const drop=function(list){return (list||[]).filter(function(x){
+if(!x||!x.fromUid)return !0;          // 本机原有，保留
+return String(x.fromUid)===uid})};   // 手机端来的，只留当前号的
+w.setHist(function(list){const n=drop(list);w.hist=n;return n});
+w.setFav(function(list){const n=drop(list);w.fav=n;return n});
 hqMergedOnce=!1;
 }
 }
@@ -113,47 +124,112 @@ signal:AbortSignal.timeout(4000)});return r.ok}catch(e){return!1}}
 //   1) 手机端历史有几百条，一次性塞进去会把界面压垮 —— 所以要分批追加。
 //   2) 服务端返回的顺序不一定是最新的在前 —— 必须自己按 updatedAt 排，
 //      否则截断后留下的反而是旧记录。
+// 手机端历史有几百条（实测 574 条），一次性全塞进界面会把界面压垮
+// （2026-10-07 用户实测过一次崩溃）。
+// 所以每轮刷新只并进最新的一批（按 updatedAt 排序取前 HQ_PHONE_MAX）。
+// 已在列表里的会被 seen 过滤掉，因此下一轮刷新自然轮到下一批 ——
+// 多刷几次即全量收敛，且每轮界面增量可控。
+// 配合 hqPersistMerged 落盘，重启后已合并的部分不会重来。
 var HQ_PHONE_MAX=120, HQ_PHONE_STEP=40;
 function hqRemoteLibrary(){
 return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)}
+
+// 合并后的最终片单。
+// 不再依赖 React 的 setState 回调去读结果：__hqLib.hist 是上游加载时的
+// 合并前快照，拿它做落盘会一条都写不进去（2026-07-07 复核发现）。
+// 这里在纯 JS 里算出最终数组，返回给调用方，落盘与 UI 用同一份数据。
 async function hqMergeLibrary(localFav,localHist,setFav,setHist){
 try{
-const r=await hqRemoteLibrary();if(!r)return;
+const r=await hqRemoteLibrary();if(!r)return null;
+const uid=hqCachedUid();
+const favOut=(localFav||[]).slice();
+const histOut=(localHist||[]).slice();
 if(r.favoritesOk&&Array.isArray(r.favorites)&&r.favorites.length){
-const seen=new Set((localFav||[]).map(function(x){return String(x.seriesId)}));
-const merged=(localFav||[]).slice();
+const seen=new Set(favOut.map(function(x){return String(x.seriesId)}));
 r.favorites.forEach(function(f){const id=String(f.seriesId||"");
-if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:f.title||"",
+if(id&&!seen.has(id)){seen.add(id);favOut.push({seriesId:id,title:f.title||"",
 cover:f.cover||"",tags:[],actors:[],intro:"",episodeCount:Number(f.episodeCount)||0,
-hotText:"",fromPhone:!0})}});
-if(merged.length!==(localFav||[]).length)setFav(merged)}
+hotText:"",fromPhone:!0,fromUid:uid})}});
+if(favOut.length!==(localFav||[]).length)setFav(favOut)}
 if(r.historyOk&&Array.isArray(r.history)&&r.history.length){
-const seen=new Set((localHist||[]).map(function(x){return String(x.seriesId)}));
+const cloud={};
+r.history.forEach(function(h){if(h&&h.seriesId)cloud[String(h.seriesId)]=h});
+// 本机已有的条目：手机端进度更靠前时把本机那条「就地抬高」。
+// 之前只做「手机端有、本机没有」的追加，所以「手机看到 520 集、PC 本地 500 集」
+// 合并完还是显示 500 —— 用户明确要求取更靠前的那一个。
+let raised=0;
+for(let i=0;i<histOut.length;i++){
+const x=histOut[i];const c=cloud[String(x.seriesId)];
+if(!c)continue;
+const cep=Number(c.episode)||0,lep=Number(x.lastEpisode)||0;
+if(cep>lep){histOut[i]=Object.assign({},x,{lastEpisode:cep,
+episodeCount:Number(c.total)||x.episodeCount||0});raised++}}
+if(raised)setHist(histOut.slice());
+// 「取最新的一批」：先按 seen 过滤掉已有的，再排序截断。
+// seen 用合并后的 histOut（含本机 + 刚抬高的），否则下一轮会把同一条又拉一遍。
+const seen=new Set(histOut.map(function(x){return String(x.seriesId)}));
 const extra=r.history.filter(function(h){return h&&h.seriesId&&!seen.has(String(h.seriesId))})
-.slice().sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0)})
+.sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0)})
 .slice(0,HQ_PHONE_MAX)
 .map(function(h){return {seriesId:String(h.seriesId),title:h.title||"",cover:h.cover||"",
-tags:[],actors:[],intro:"",hotText:"",
-lastEpisode:Number(h.episode)||1,episodeCount:Number(h.total)||0,fromPhone:!0}});
-if(!extra.length)return;
+tags:[],actors:[],intro:[],hotText:"",
+lastEpisode:Number(h.episode)||1,episodeCount:Number(h.total)||0,
+fromPhone:!0,fromUid:uid}});
 // 分批追加：每批 HQ_PHONE_STEP 条，让界面能喘口气。
 for(let i=0;i<extra.length;i+=HQ_PHONE_STEP){
 const part=extra.slice(i,i+HQ_PHONE_STEP);
-setHist(function(prev){
-const have=new Set((prev||[]).map(function(x){return String(x.seriesId)}));
-const add=part.filter(function(x){return !have.has(String(x.seriesId))});
-return add.length?(prev||[]).concat(add):prev})}
+for(const x of part)histOut.push(x);
+setHist(histOut.slice())}
 }
-}catch(e){}}
+return {fav:favOut,hist:histOut};
+}catch(e){return null}}
+
+// 把合并结果写回本机片单（sqlite）。
+// 之前合并只改 React 内存状态：窗口刷新/重开就回到本地那份，
+// 手机端历史又得重新拉一遍，而且用户看不到「已合并」的稳定结果。
+// 传进来的 merged 是 hqMergeLibrary 返回的最终数组（不是合并前快照）。
+var hqPersisting=!1;
+async function hqPersistMerged(merged){
+const T=window.__TAURI_INTERNALS__;if(!T||!T.invoke)return 0;
+if(hqPersisting)return 0;hqPersisting=!0;
+try{
+let local=[];
+try{const h=await T.invoke("list_history");if(Array.isArray(h))local=h}catch(e){}
+const have=new Set(local.map(function(x){return String(x.seriesId)}));
+const cur=(merged&&merged.hist)||[];
+let added=0;
+for(const x of cur){
+const id=String(x.seriesId||"");if(!id||have.has(id))continue;
+if(!/^\d{8,24}$/.test(id))continue;
+try{
+await T.invoke("add_history",{series:{seriesId:id,title:x.title||"",
+cover:x.cover||"",intro:typeof x.intro==="string"?x.intro:"",
+tags:Array.isArray(x.tags)?x.tags:[],actors:Array.isArray(x.actors)?x.actors:[],
+episodeCount:Number(x.episodeCount)||0},lastEpisode:Number(x.lastEpisode)||1});
+have.add(id);added++}catch(e){}}
+return added;
+}catch(e){return 0}finally{hqPersisting=!1}}
 
 // 合并入口。
 // 之前只在「首次加载」跑一次（hqMergedOnce 标志），
 // 导致看完一集再进历史页看到的还是旧记录，必须手动点「历史」才刷新。
 // 现在改成可重复调用：进历史页 / 切回前台 / 账号页确认连通后都会拉一次。
+// 播放器关闭 / 切集时调一次缓存回收。
+// 原先只有「看完一集（onEnded）」才清缓存，中途关播放器、快速切集、
+// 直接关软件这三条路径都不清，缓存就一路涨（用户明确反馈过）。
+// 这里在关闭播放器时兜一次：按数量上限回收 + 清过期 .partial。
+function hqPruneCache(streamUrl){
+const v=hqApiInfo(streamUrl)||hqApi();if(!v)return Promise.resolve(null);
+return fetch(v.origin+"/desktop/cache/prune",{method:"POST",
+headers:{"x-api-key":v.key},credentials:"omit",redirect:"error",keepalive:!0})
+.then(function(r){return r.ok?r.json().catch(function(){return null}):null})
+.catch(function(){return null})}
+
 var hqMergedOnce=!1;
 function hqMergeOnce(){if(hqMergedOnce)return;const w=window.__hqLib;
 if(!w||!w.setFav||!w.setHist)return;hqMergedOnce=!0;
-return hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist)}
+return hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist).then(function(m){
+void hqPersistMerged(m)})}
 // 强制刷新（忽略一次性标志），用于进入历史页 / 切回前台。
 var hqRefreshing=!1;
 async function hqRefreshLibrary(){
@@ -161,9 +237,15 @@ const w=window.__hqLib;if(!w||!w.setFav||!w.setHist)return;
 if(hqRefreshing)return;hqRefreshing=!0;
 try{
 if(!hqApi())await hqEnsureApi();
-if(!(await hqApiAlive()))return;
-await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist);
+// 凭据失效时（应用重启后端口/密钥会换）必须清掉，否则这里会永远
+// 直接 return，刷新路径永久空转 —— 账号面板那条路径就是这么做的，
+// 这里之前漏了，所以「切回前台自动刷新」实际不生效。
+if(!(await hqApiAlive())){hqForgetApi();
+if(!(await hqEnsureApi()))return;
+if(!(await hqApiAlive()))return}
+const merged=await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist);
 hqMergedOnce=!0;
+void hqPersistMerged(merged);
 }catch(e){}finally{hqRefreshing=!1}}
 // 进入历史页时刷新一次（切页由下面的 hook 触发）。
 if(!window.__hqRefreshHooked){
@@ -346,6 +428,14 @@ def patch(text):
         "localStorage.setItem(um(C,o),String(tt)),rt.current=tt,"
         "hqRememberApi(C.streamUrl),hqSyncProgress(C.streamUrl,C.seriesId,C.episode,Pt,tt,$i.duration)",
         "进度上报账号")
+
+    # 3b) 关闭播放器时兜一次缓存回收（覆盖「没看完就退出」）
+    s = _sub_once(
+        s,
+        re.escape('qi(),di(),ye.current+=1,ci({kind:"playerClosePause"})'),
+        'qi(),void hqPruneCache(C.streamUrl),di(),ye.current+=1,'
+        'ci({kind:"playerClosePause"})',
+        "关闭播放器回收缓存")
 
     # 4) 收藏切换成功后同步账号
     s = _sub_once(

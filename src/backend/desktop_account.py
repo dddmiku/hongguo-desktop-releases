@@ -690,9 +690,17 @@ def sync_progress(series_id, episode, total=0, position=0, duration=0, series=No
               body={"update_datas": [item]})
     j = _json(r)
     if j.get("code") not in (0, "0"):
+        log_event("progress_failed", series_id=series_id, episode=episode,
+                  code=j.get("code"), message=str(j.get("message"))[:80])
         return {"ok": False, "code": j.get("code"),
                 "error": j.get("message") or "上报失败"}
     fails = ((j.get("data") or {}).get("update_fail_datas") or []) if isinstance(j.get("data"), dict) else []
+    # 成功也要记一笔：原先只有「跳过」才写日志，导致事后排查时
+    # 「一次 progress 都没有」既可能是没上报、也可能是上报成功没记，
+    # 无法区分（2026-10-07 排查时就踩了这个坑）。
+    log_event("progress_ok", series_id=series_id, episode=episode,
+              position=int(max(0, position)), total=int(max(0, total)),
+              has_vid=bool(vid), failed=len(fails))
     return {"ok": not fails, "code": 0, "episode": episode, "failed": len(fails)}
 
 

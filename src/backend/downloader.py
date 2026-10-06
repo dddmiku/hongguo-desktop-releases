@@ -45,7 +45,7 @@ def _probe(url):
     """探测总大小 + 是否支持 Range(206)。返回 (total, range_ok)。失败返回 (0, False)。"""
     try:
         with _dl_session().get(url, headers={"Range": "bytes=0-0"}, stream=True,
-                               verify=False, timeout=30) as r:
+                               verify=True, timeout=30) as r:
             if r.status_code == 206:
                 cr = r.headers.get("content-range", "")  # bytes 0-0/12345
                 total = int(cr.split("/")[-1]) if "/" in cr else 0
@@ -71,7 +71,7 @@ def _download_segmented(url, tmp, total, nseg, on_progress):
         try:
             s = _dl_session()
             with s.get(url, headers={"Range": f"bytes={lo}-{hi}"}, stream=True,
-                       verify=False, timeout=60) as r:
+                       verify=True, timeout=60) as r:
                 if r.status_code not in (206, 200):
                     raise requests.RequestException(f"HTTP {r.status_code}")
                 with open(tmp, "r+b") as f:
@@ -115,7 +115,7 @@ def download_one(url, path, expected_size=None, refetch=None, retries=5, on_prog
             # 单流(断点续传): 不支持Range/文件小/已有.part续传
             done = os.path.getsize(tmp) if os.path.exists(tmp) else 0
             headers = {"Range": f"bytes={done}-"} if done else {}
-            with _dl_session().get(url, stream=True, headers=headers, verify=False, timeout=60) as r:
+            with _dl_session().get(url, stream=True, headers=headers, verify=True, timeout=60) as r:
                 if r.status_code == 416:  # range超出=已完整
                     break
                 if done and r.status_code == 200:
