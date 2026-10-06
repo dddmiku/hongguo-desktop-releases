@@ -40,6 +40,13 @@ SESSION_PATH = os.environ.get("HONGGUO_ACCOUNT_FILE") or os.path.join(
 # 验证码登录接口所在的 host（与主 API host 不同）
 PASSPORT_HOST = os.environ.get("HONGGUO_PASSPORT_HOST", "security.snssdk.com")
 
+# 护照接口的 UA 必须与真机一致（模拟器抓包原文）。
+# 用内容接口那套 UA 或自定义 UA 会被风控判为异常客户端，登录直接返回 error_code=7。
+PASSPORT_UA = os.environ.get(
+    "HONGGUO_PASSPORT_UA",
+    "com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; "
+    "Build/V417IR;tt-ok/3.12.13.20)")
+
 # ---- 护照请求的设备身份 ---------------------------------------------------
 # 护照接口会校验设备指纹：device_id / iid / cdid 缺失会被判为异常客户端。
 # 内容接口不校验这些（所以搜索播放一直正常），只有登录会踩到。
@@ -61,6 +68,20 @@ PASSPORT_DEVICE_DEFAULTS = {
     "is_android_pad_screen": "0", "okhttp_version": "4.2.243.31-douyin",
     "use_store_region_cookie": "1", "use_new_token_expire_rule": "true",
     "passport-sdk-version": "5051452",
+    # 运行态/会话字段：真机每次请求都带，缺失可能被判为异常客户端
+    "aid": "8662", "app_name": "novelread", "device_platform": "android",
+    "gender": "2", "har_status": "0", "charging": "0",
+    "network_type": "4", "down_speed": "60000", "font_scale": "100",
+    "battery_pct": "93", "screen_brightness": "102", "current_volume": "0",
+    "app_dark_mode": "0", "sys_dark_mode": "0", "sys_mini_window": "0",
+    "app_mini_window": "0", "is_power_save_mode": "0",
+    "normal_session_cnt_in_day": "1", "normal_session_cnt_in_life": "1",
+    "cold_start_session_cnt_in_day": "1", "cold_start_session_cnt_in_life": "1",
+}
+
+# 允许放进请求体的字段（registered / source 等本地标记必须排除）
+PASSPORT_BODY_FIELDS = set(PASSPORT_DEVICE_DEFAULTS) | {
+    "device_id", "iid", "cdid", "normal_session_id", "cold_start_session_id",
 }
 
 
@@ -126,6 +147,24 @@ def _from_emulator():
     return None
 
 
+def _session_ids():
+    """真机会带会话 id（形如 <uuid>#<序号>）。缺失时补上并固定。"""
+    data = load_device()
+    changed = False
+    for key, suffix in (("normal_session_id", "#1"), ("cold_start_session_id", "")):
+        if not data.get(key):
+            import uuid
+            data[key] = str(uuid.uuid4()) + suffix
+            changed = True
+    if changed and data.get("registered"):
+        try:
+            io.open(DEVICE_PATH, "w", encoding="utf-8").write(
+                json.dumps(data, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+    return data
+
+
 def load_device():
     """本机设备身份：一旦确定就固定下来，避免每次登录换设备。"""
     env = _from_env()
@@ -162,7 +201,7 @@ def load_device():
 def passport_query():
     """护照请求要带的完整设备参数（内容接口那套精简 query 不够用）。"""
     query = dict(PASSPORT_DEVICE_DEFAULTS)
-    query.update(load_device())
+    query.update(_session_ids())
     return query
 SMS_TYPE = os.environ.get("HONGGUO_SMS_TYPE", "24")   # 抓包: type=24 → 登录场景
 
@@ -219,6 +258,22 @@ def read_log(limit=50):
 def xor_hex(text):
     """红果 passport 的字段编码：UTF-8 字节逐字节异或 0x05，再转小写 hex。"""
     return bytes(b ^ 5 for b in str(text).encode("utf-8")).hex()
+
+
+def normalize_mobile(mobile):
+    """护照接口要求手机号带国家码并按 3-4-4 分组。
+
+    实测：真机发的是 '+86157 3063 9941'（含 '+86' 与空格），
+    XOR(0x05) 后与抓包逐字节一致；发裸 11 位会被判为非法号码，
+    服务端直接返回 error_code=7（提示却是「系统繁忙」）。
+    """
+    digits = re.sub(r"\D", "", str(mobile or ""))
+    if len(digits) == 13 and digits.startswith("86"):
+        digits = digits[2:]
+    if len(digits) == 11 and digits.startswith("1"):
+        # 真机形态：+86 前缀 + 3-4-4 分组（组间是空格）
+        return "+86" + digits[:3] + " " + digits[3:7] + " " + digits[7:11]
+    return ("+86" + digits) if digits else ""
 
 
 def xor_unhex(value):
@@ -318,6 +373,16 @@ def _call(method, path, body=None, extra=None, session=None, host=None, form=Non
         data = _gzip_body(body)
         headers["content-encoding"] = "gzip"
         headers["x-ss-stub"] = hashlib.md5(data).hexdigest().upper()
+    if passport:
+        # 真机护照请求的三个硬性条件（2026-10-07 抓包 + 剥离实验确认）：
+        #   1) UA 必须是 App 原文（内容接口那套 UA 会被判异常客户端 → error_code=7）
+        #   2) 必须带 x-ss-req-ticket（毫秒时间戳），否则同样退化成 error_code=7
+        #   3) 请求体必须带 x-ss-stub（登录/发码都是表单，所以是真机那种 32 位大写十六进制）
+        # 只补 1+2 仍然失败；补上 3 后服务端才放行（错误码从 7 变成「验证码错误/过期」）。
+        headers["user-agent"] = PASSPORT_UA
+        headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
+        if data is not None:
+            headers["x-ss-stub"] = hashlib.md5(data).hexdigest().upper()
     headers.update(H.sign(url, headers))
     headers.pop("accept-encoding", None)
     r = H.http_request(method, url, data=data, headers=headers, timeout=30)
@@ -351,8 +416,9 @@ def _passport_form(mobile=None, code=None, with_device=False):
         "mix_mode=1",
     ]
     if with_device:
-        for key, value in passport_query().items():
-            if key in ("_rticket", "passport-sdk-version"):
+        query = passport_query()
+        for key, value in query.items():
+            if key not in PASSPORT_BODY_FIELDS:
                 continue
             parts.append("%s=%s" % (key, quote(str(value), safe="")))
     return "&".join(parts)
@@ -378,7 +444,8 @@ def send_code(mobile):
     mobile = re.sub(r"\D", "", str(mobile or ""))
     if not re.fullmatch(r"1\d{10}", mobile):
         return {"ok": False, "error": "手机号格式不正确"}
-    form = (_passport_form(mobile=mobile, with_device=True) + "&type=" + xor_hex(SMS_TYPE)
+    form = (_passport_form(mobile=normalize_mobile(mobile), with_device=True)
+            + "&type=" + xor_hex(SMS_TYPE)
             + "&unbind_exist=" + xor_hex("1") + "&auto_read=0")
     r = _call("POST", "/passport/mobile/send_code/v1/", form=form,
               session={}, host=PASSPORT_HOST, passport=True)
@@ -441,7 +508,7 @@ def sms_login(mobile, code):
         return {"ok": False, "error": "手机号格式不正确"}
     if not re.fullmatch(r"\d{4,8}", code):
         return {"ok": False, "error": "验证码格式不正确"}
-    form = _passport_form(mobile=mobile, code=code, with_device=True)
+    form = _passport_form(mobile=normalize_mobile(mobile), code=code, with_device=True)
     r = _call("POST", "/passport/mobile/sms_login/", form=form,
               session={}, host=PASSPORT_HOST, passport=True)
     j = _json(r)
