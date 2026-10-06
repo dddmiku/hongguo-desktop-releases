@@ -528,18 +528,17 @@ if os.environ.get("HONGGUO_SESSION_API_KEY") and os.environ.get("HONGGUO_HLS_WOR
     from desktop_hls_service import HlsJobs, make_router, DESKTOP_ORIGINS
     from fastapi.middleware.cors import CORSMiddleware
 
-    def _desktop_source(series_id, episode, quality="desktop-resolution-v1"):
+    def _desktop_source(series_id, episode, quality="desktop-resolution-v1", cancelled=None):
         _, episodes = H.get_episodes(series_id)
         target = next((item for item in episodes if item.get("index") == episode), None)
         if not target or not re.fullmatch(r"[0-9]{8,24}", str(target.get("vid", ""))):
             raise ValueError("Episode media identity unavailable")
-        # Quality is validated by the HLS router before it reaches here.
+        # 清晰度由 HLS 路由校验后传到这里。
         decrypted = _ensure_decrypted(str(target["vid"]), quality or "desktop-resolution-v1")
-        # Hand the HLS encoder a pre-encoded H.264 cache instead of the HEVC
-        # source: stream-copy then costs ~0.16s instead of a ~3.8s transcode.
-        # The cache is built once per (vid, quality) and reused afterwards.
+        # 交给 HLS 编码器已转码的 H.264 缓存:
+        # stream-copy 约 0.16s, 而重编码 HEVC 约 3.8s。
         from desktop_encode import encode_h264
-        return encode_h264(decrypted)
+        return encode_h264(decrypted, cancelled)
 
     _desktop_jobs = HlsJobs(os.environ["HONGGUO_HLS_WORK_DIR"], _desktop_source)
     app.include_router(make_router(_desktop_jobs, _keys.is_valid))

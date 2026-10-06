@@ -1,0 +1,113 @@
+--- base/backend/desktop_hls_service.py
++++ src/backend/desktop_hls_service.py
+@@ -38,12 +38,13 @@
+ 
+ 
+ class HlsJobs:
+-    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=4, max_workers=2, idle_seconds=300):
++    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=6, max_workers=3, idle_seconds=300, queue_wait=8.0):
+         self.root = Path(root).resolve(strict=True)
+         if not self.root.is_dir() or self.root.is_symlink():
+             raise ValueError("Desktop work directory is unavailable")
+         self.source_loader, self.encoder = source_loader, encoder
+         self.max_jobs, self.max_workers, self.idle_seconds = max_jobs, max_workers, idle_seconds
++        self.queue_wait = float(queue_wait)
+         self.jobs = {}
+         self.guard = threading.RLock()
+ 
+@@ -62,27 +63,45 @@
+             if time.monotonic() - job.touched > self.idle_seconds:
+                 self.release(job.id)
+ 
+-    def create(self, series_id, episode, *, start_seconds=0):
++    def create(self, series_id, episode, *, start_seconds=0, quality="auto"):
+         if not re.fullmatch(r"[0-9]{8,24}", series_id) or not 1 <= episode <= 100000:
+             raise HTTPException(400, "Invalid episode identity")
+         if (not isinstance(start_seconds, (int, float)) or isinstance(start_seconds, bool)
+                 or not math.isfinite(start_seconds) or not 0 <= start_seconds <= 86400):
+             raise HTTPException(400, "Invalid desktop start position")
+-        with self.guard:
+-            self._expire()
+-            active = sum(not job.done.is_set() for job in self.jobs.values())
+-            if len(self.jobs) >= self.max_jobs or active >= self.max_workers:
++        # 本地维护: 编码池改为「有界排队」。
++        # 上游原来在槽位占满时立刻 503；而切集瞬间旧任务还在收尾，
++        # 于是下一集必然报「媒体准备失败」。这里改为短暂等待槽位，
++        # 并把「已取消、尚未收尾」的任务排除在占用之外。
++        deadline = time.monotonic() + self.queue_wait
++        while True:
++            with self.guard:
++                self._expire()
++                live = sum(not job.cancelled.is_set() for job in self.jobs.values())
++                active = sum(not job.done.is_set() and not job.cancelled.is_set()
++                             for job in self.jobs.values())
++                if live < self.max_jobs and active < self.max_workers:
++                    identifier = uuid.uuid4().hex
++                    job = Job(identifier, self.root / identifier,
++                              start_seconds=float(start_seconds),
++                              window_origin=None if start_seconds else 0.0)
++                    self.jobs[identifier] = job
++                    threading.Thread(target=self._run, args=(job, series_id, episode, quality),
++                                     daemon=True).start()
++                    return job
++            if time.monotonic() >= deadline:
+                 raise HTTPException(503, "Desktop encoder is busy; retry shortly")
+-            identifier = uuid.uuid4().hex
+-            job = Job(identifier, self.root / identifier,
+-                      start_seconds=float(start_seconds), window_origin=None if start_seconds else 0.0)
+-            self.jobs[identifier] = job
+-            threading.Thread(target=self._run, args=(job, series_id, episode), daemon=True).start()
+-            return job
+-
+-    def _run(self, job, series_id, episode):
++            time.sleep(0.15)
++
++    def _run(self, job, series_id, episode, quality="auto"):
+         try:
+-            source = self.source_loader(series_id, episode)
++            # 本地维护: 把取消信号透传给取源/转码, 切集时旧任务能立刻停下,
++            # 不再长时间占着工作槽位。上游 source_loader 只收 3 个参数。
++            try:
++                source = self.source_loader(series_id, episode, quality,
++                                            cancelled=job.cancelled.is_set)
++            except TypeError:
++                source = self.source_loader(series_id, episode, quality)
+             if job.cancelled.is_set():
+                 raise EncodingCancelled()
+             import av
+@@ -213,12 +232,12 @@
+                 "seekWindow": True, "windowVersion": 1, "maxStartSeconds": 86400}
+ 
+     @router.post("")
+-    def prepare(request: Request, series_id: str, ep: int, start_seconds: float = 0):
++    def prepare(request: Request, series_id: str, ep: int, start_seconds: float = 0, quality: str = "auto"):
+         names = [name for name, _ in request.query_params.multi_items()]
+-        if (any(name not in {"series_id", "ep", "start_seconds"} for name in names)
++        if (any(name not in {"series_id", "ep", "start_seconds", "quality"} for name in names)
+                 or len(set(names)) != len(names)):
+             raise HTTPException(400, "Invalid desktop request parameters")
+-        return {"id": jobs.create(series_id, ep, start_seconds=start_seconds).id}
++        return {"id": jobs.create(series_id, ep, start_seconds=start_seconds, quality=normalize_desktop_quality(quality)).id}
+ 
+     @router.get("/{identifier}/status")
+     def status(identifier: str):
+@@ -251,3 +270,19 @@
+         return FileResponse(path, media_type="video/mp4", headers=headers)
+ 
+     return router
++
++
++# ---- 本地维护: 播放器可选清晰度 ----
++DESKTOP_QUALITY_CHOICES = ("auto", "1080p", "720p", "540p", "480p", "360p")
++
++
++def normalize_desktop_quality(value):
++    """把播放器传来的档位规范成选轨用的名称。
++
++    auto 走上游原有的 desktop-resolution-v1 策略; 其余档位原样交给
++    offline_dl._pick_track（不存在时回退到不超过请求的最高一档）。
++    """
++    text = (value or "auto").strip().lower()
++    if text not in DESKTOP_QUALITY_CHOICES:
++        raise HTTPException(400, "Unsupported desktop quality")
++    return "desktop-resolution-v1" if text == "auto" else text

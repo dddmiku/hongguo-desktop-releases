@@ -1,0 +1,177 @@
+红果桌面版「跳转下一集后媒体准备失败 / 白屏」修复 —— 验证记录
+================================================================
+日期: 2026-10-06
+目标对象 TARGET:
+  d:\Users\dddmiku\AppData\Local\红果免费短剧\hongguo-desktop-companion.exe
+  d:\Users\dddmiku\AppData\Local\红果免费短剧\backend\desktop_hls_service.py
+  d:\Users\dddmiku\AppData\Local\红果免费短剧\backend\desktop_encode.py
+  d:\Users\dddmiku\AppData\Local\红果免费短剧\backend\server.py
+
+--------------------------------------------------------------
+一、根因（已实测复现）
+--------------------------------------------------------------
+1) 编码池瞬间 503
+   上游 HlsJobs.create() 在槽位占满时立刻抛
+     HTTPException(503, "Desktop encoder is busy; retry shortly")
+   默认 max_workers=2、max_jobs=4。
+   切换下一集时，旧任务仍在收尾（未被标记取消 / 未 done），
+   于是新一集直接吃 503。前端只在 200ms 后重试一次，仍失败 →
+   界面显示「播放中断，请重试当前集。／第 N 集 · 媒体准备失败」。
+
+   复现（真实进程内，直接打本机 HLS 接口）:
+     POST ep=901 -> 200
+     POST ep=902 -> 200
+     POST ep=903 -> 503
+     POST ep=904 -> 503
+     POST ep=905 -> 503
+     POST ep=906 -> 503
+
+   真实会话抓包（修复前，WebView 网络事件）:
+     POST ?series_id=...&ep=745 -> 503
+     POST ?series_id=...&ep=746 -> 503
+     POST ?series_id=...&ep=744 -> 503
+   与用户截图「第 728/1000 集 · 媒体准备失败」一致。
+
+2) 打包后白屏
+   上游每次发版会更换 Vite 产物哈希文件名（如 index-CEHZDRVO.js）。
+   安装包内的 index.html 与 exe 内嵌资源不同批时，
+   index.html 仍引用旧文件名 → 脚本 404 → 页面全白。
+   实测控制台报错:
+     Failed to load module script: Expected a JavaScript-or-Wasm module
+     script but the server responded with a MIME type of "text/html".
+   修复前 exe 内 index.html 引用 /assets/index-CEHZDRVO.js，
+   而实际键为 /assets/index-Bm6fM3_d.js。
+
+3) 部署脚本漏文件
+   tools/deploy.ps1 只同步 server.py / desktop_hls.py /
+   desktop_hls_service.py，从未同步 desktop_encode.py。
+   后端补丁给 encode_h264 增加了 cancelled 形参，
+   但旧版 desktop_encode.py 不接受该参数 → 取源阶段抛
+   TypeError → 同样表现为「媒体准备失败」。
+
+--------------------------------------------------------------
+二、修改点
+--------------------------------------------------------------
+A. desktop_hls_service.py
+   - 新增 queue_wait（默认 8.0s）；create() 改为有界排队：
+     槽位满时等待，而不是立刻 503。
+   - 占用判定把「已取消、尚未收尾」的任务排除：
+       live   = 未取消的任务数        < max_jobs
+       active = 未完成且未取消的任务数 < max_workers
+   - max_jobs 4→6、max_workers 2→3。
+   - source_loader 调用透传 cancelled=job.cancelled.is_set，
+     使切集时旧任务能立刻停下；对只收 3 个参数的旧实现回退兼容。
+
+B. desktop_encode.py
+   - encode_h264(source, cancelled=None)；
+     demux 循环内检测取消，命中即抛错停止转码，
+     不再让已放弃的任务长时间占着编码槽位。
+
+C. server.py
+   - _desktop_source(series_id, episode, quality, cancelled=None)
+     把 cancelled 继续传给 encode_h264。
+
+D. app.js（前端）
+   - 新增 hqPost(run, aborted)：对开场 POST 做最多 6 次、
+     指数退避（250ms 递增）的重试；仅在收到 503 且未中止时重试。
+   - 两处「503 后只重试一次」的旧逻辑替换为 hqPost。
+
+E. tools/repack.py + tools/verify_repack.py + tools/auto_patch.py
+   - 新增 align_index_html()：打包时把 index.html 里的
+     script src / link href 重写到 exe 内真实存在的资源键，
+     版本无关，杜绝白屏。
+
+F. tools/deploy.ps1 + tools/restore.ps1 + tools/auto_patch.py
+   - 同步/备份文件清单补齐 desktop_encode.py。
+
+--------------------------------------------------------------
+三、验证证据（均为实际运行输出）
+--------------------------------------------------------------
+[1] 编码池行为对比（离线、同一测试夹具、慢编码器 2s）
+    命令: python _txn/pool_test.py
+
+    BASELINE（上游原版 base/backend）:
+      [基线 上游原版] max_jobs=4 max_workers=2 queue_wait=N/A
+         ep=1 -> accepted
+         ep=2 -> accepted
+         ep=3 -> rejected 503
+      BASELINE accepted = 2
+
+    MODIFIED（补丁后 src/backend）:
+      [修改后] max_jobs=4 max_workers=2 queue_wait=8.0
+         ep=1 -> accepted
+         ep=2 -> accepted
+         ep=3 -> accepted
+      MODIFIED accepted = 3
+      [PASS]
+
+[2] 真实进程内 5 次连续切集（不释放旧会话，模拟用户狂点下一集；最终参数）
+    命令: node _txn/pool_live.js http://127.0.0.1:<port> <key> <series>
+
+    0.03s  POST ep=100 -> 200
+    0.15s  POST ep=101 -> 200
+    0.58s  POST ep=102 -> 200
+    0.70s  POST ep=103 -> 200
+    1.12s  POST ep=104 -> 200
+    结果: 5 次连续切集, 成功 5 次, 503 0 次
+    五个会话全部 complete: dur=67.0 / 60.3 / 49.8 / 70.9 / 55.2
+
+[3] 真实应用内连续点「下一集」8 次（修复后，最终参数）
+    切集 1: 第 799/1000 集 · 正在准备播放位置
+    切集 2: 第 800/1000 集 · 正在准备播放位置
+    切集 3: 第 801/1000 集 · 播放中
+    切集 4..8: 第 802..806/1000 集 · 正在准备播放位置
+    POST 总数: 14  4xx/5xx: 0
+    停手后静置 25 秒: 第 807/1000 集 · 播放中，1920x1080，无中断提示
+    → 全程未再出现「播放中断，请重试当前集。」
+
+[4] 打包产物一致性
+    命令: python tools/verify_repack.py dist\hongguo-desktop-companion.exe
+    /assets/index-Bm6fM3_d.js: clen=268946 raw=1033162 sha=f42663ca24ae5816 与 src 一致=True
+    /assets/index-Cfv6YY8_.css: clen=9802 raw=52273 sha=5cc32399f4fb5903 与 src 一致=True
+    /index.html: clen=229 raw=549 sha=30a28220421cc553 与 src 一致=True
+    [OK] 全部一致
+
+[5] 白屏修复前后（exe 内 index.html 实际内容）
+    修复前: <script ... src="/assets/index-CEHZDRVO.js">   ← 该键不存在
+    修复后: <script ... src="/assets/index-Bm6fM3_d.js">    ← 与内嵌键一致
+
+[6] 部署后哈希（本次最终部署，基线 = 上游 1.0.9 原版 exe）
+    exe                   : 9253CF208525F2FE286AFBD94326AF7DD90436AC0AA52ACA86DE3832B0DAAA9B
+    server.py             : C7370D8127DBB67AE5FAFD26BE9A1D1723B31E6041E57F20370497C7E399E074
+    desktop_hls.py        : CA52216352E4AAA104D0AF5B2E7039F8E997FBA70EC573124AF984A38B0586D5
+    desktop_hls_service.py: A708E02048BC33F8ECB1BF743D9C5F0EBE70F46CCCF83E8CA7C9E3BC28790727
+    desktop_encode.py     : 9EB4C3EC57C676526080CA57577CE2A786EDAA3C7EEE425840B76CD6BD327599
+    src/backend 四个文件与已部署文件哈希逐一相等: True
+
+    基线洁净性核对（base/ 必须等于上游原版，否则打包会拿错版本）:
+      base/backend/desktop_hls_service.py  == _v109/extracted 原版: True
+      base/backend/desktop_hls.py          == _v109/extracted 原版: True
+      base/backend/server.py               == _v109/extracted 原版: True
+      base/backend/desktop_encode.py       == _v109/extracted 原版: True
+      base/backend/desktop_hls_budget.py   == _v109/extracted 原版: True
+      base/frontend/app.js|css|index.html  == _work/orig 原版    : True
+      （过程中曾误用 1.0.4 旧备份打包，已改正并重新打包部署，见第五节）
+
+--------------------------------------------------------------
+四、未覆盖 / 待确认
+--------------------------------------------------------------
+- 未做「上游 1.0.9 → 更高版本」的实机自动升级演练（本轮只验证了
+  现有 1.0.9 上的修复与打包链路）。自动重注入脚本已同步修正
+  （补 desktop_encode.py 与 index.html 对齐），下次发版可直接复用。
+- 未覆盖长会话（>30 分钟连续播放）下的内存/缓存增长观察。
+- 快速连点超过 6 次/秒的极端场景未单独压测；当前实测
+  4 秒间隔连续 8 次、0.12 秒间隔连续 5 次均通过。
+
+--------------------------------------------------------------
+五、本轮自查发现并改正的问题（重要）
+--------------------------------------------------------------
+打包时一度误用 _backup/orig 里的 1.0.4 旧版 exe 作为基线，
+而机器上实际安装的是 1.0.9 → 打出的包会把应用降级成 1.0.4。
+已改正:
+  - 用 _v109/extracted（1.0.9 原版）刷新 _backup/orig 的 exe 与
+    backend 全部文件；
+  - 重新执行 前端补丁 → 后端补丁 → repack → verify → deploy；
+  - 核对 base/ 的 5 个后端文件与 3 个前端文件均与上游原版逐字节相同；
+  - 最终 exe FileVersion = 1.0.9，dist 与安装目录哈希一致。
+

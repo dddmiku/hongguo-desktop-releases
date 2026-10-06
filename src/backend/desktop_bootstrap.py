@@ -9,6 +9,8 @@ import time
 import json
 import re
 import threading
+import ctypes
+import struct
 
 _stage = "handshake"
 _signer_exit_code = None
@@ -72,6 +74,65 @@ def announce_endpoint(listener):
     return port
 
 
+class TcpRow(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in
+                ("state", "address", "port", "remote_address", "remote_port", "pid")]
+
+
+class TcpTable(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_uint32), ("rows", TcpRow * 1)]
+
+
+def parse_listener_table(raw, pid):
+    if len(raw) < ctypes.sizeof(ctypes.c_uint32):
+        raise RuntimeError("Truncated listener count")
+    count = ctypes.c_uint32.from_buffer_copy(raw).value
+    offset, stride = TcpTable.rows.offset, ctypes.sizeof(TcpRow)
+    if offset + count * stride > len(raw):
+        raise RuntimeError("Truncated listener table")
+    ports = []
+    for index in range(count):
+        row = TcpRow.from_buffer_copy(raw, offset + index * stride)
+        if row.pid != pid or row.state != 2:  # MIB_TCP_STATE_LISTEN
+            continue
+        address = socket.inet_ntoa(struct.pack("=I", row.address))
+        port = socket.ntohs(row.port & 0xffff)
+        if address != "127.0.0.1" or not 1 <= port <= 65535:
+            raise RuntimeError("Owned signer has an unexpected listener")
+        ports.append(port)
+    if len(ports) > 1:
+        raise RuntimeError("Owned signer endpoint is ambiguous")
+    return ports[0] if ports else None
+
+
+def owned_listener_port(pid, query=None):
+    if query is None:
+        # System32 lookup prevents a current-directory DLL from being loaded.
+        library = ctypes.WinDLL("iphlpapi.dll", winmode=0x00000800)
+        query = library.GetExtendedTcpTable
+        query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32),
+                          ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        query.restype = ctypes.c_uint32
+    size = ctypes.c_uint32(0)
+    code = query(None, ctypes.byref(size), False, socket.AF_INET, 3, 0)
+    if code not in (0, 122):  # ERROR_INSUFFICIENT_BUFFER
+        raise OSError(code, "Cannot inspect owned signer listener")
+    for _ in range(4):
+        if not ctypes.sizeof(ctypes.c_uint32) <= size.value <= 1024 * 1024:
+            raise RuntimeError("Unexpected listener table size")
+        allocation = size.value
+        buffer = ctypes.create_string_buffer(allocation)
+        code = query(buffer, ctypes.byref(size), False, socket.AF_INET, 3, 0)
+        if code == 122:
+            continue  # Table can grow between the size query and the read.
+        if code != 0:
+            raise OSError(code, "Cannot inspect owned signer listener")
+        if size.value > allocation:
+            raise RuntimeError("Listener table exceeds allocated buffer")
+        return parse_listener_table(buffer.raw[:size.value], pid)
+    raise RuntimeError("Listener table repeatedly changed")
+
+
 def wait_signer(process, timeout=45):
     global _signer_exit_code
     deadline = time.monotonic() + timeout
@@ -79,12 +140,45 @@ def wait_signer(process, timeout=45):
         if process.poll() is not None:
             _signer_exit_code = process.returncode
             raise RuntimeError("Signing service exited")
-        try:
-            with socket.create_connection(("127.0.0.1", 9099), timeout=0.5):
-                return
-        except OSError:
-            time.sleep(0.2)
+        port = owned_listener_port(process.pid)
+        if port is not None:
+            if process.poll() is not None:
+                _signer_exit_code = process.returncode
+                raise RuntimeError("Signing service exited")
+            return port
+        time.sleep(0.05)
     raise RuntimeError("Signing service startup timed out")
+
+
+def serve_owned_api(server, listener, signer):
+    """Stop serving when our signer exits; never attach to or restart a signer."""
+    global _signer_exit_code
+    stopped = threading.Event()
+    exited = []
+
+    def watch():
+        while not stopped.is_set():
+            code = signer.poll()
+            if code is not None:
+                exited.append(code)
+                server.should_exit = True
+                return
+            stopped.wait(0.25)
+
+    monitor = threading.Thread(target=watch, name="desktop-signer-watch", daemon=True)
+    monitor.start()
+    try:
+        server.run(sockets=[listener])
+    finally:
+        stopped.set()
+        monitor.join()
+    # Also catch an exit between the final poll and a normal API return. The
+    # caller terminates a healthy signer only after this function has returned.
+    code = exited[0] if exited else signer.poll()
+    if code is not None:
+        _signer_exit_code = code
+        stage("signer_runtime")
+        raise RuntimeError("Owned signing service exited while serving")
 
 
 def main():
@@ -104,7 +198,8 @@ def main():
         raise RuntimeError("Content configuration is missing")
     os.environ["HONGGUO_CONTENT_CONFIG"] = str(content_config)
     os.environ["ADMIN_TOKEN"] = secrets.token_hex(32)
-    os.environ["SIGN_SERVER"] = "http://127.0.0.1:9099"
+    os.environ.pop("SIGN_SERVER", None)
+    os.environ["BIND_HOST"] = "127.0.0.1"
     os.environ["HONGGUO_STREAM_CACHE"] = str(data / "stream-cache")
     if os.environ.get("HONGGUO_HLS_WORK_DIR"):
         os.environ["HONGGUO_HLS_WORK_DIR"] = launcher_path(os.environ["HONGGUO_HLS_WORK_DIR"])
@@ -121,15 +216,12 @@ def main():
     signer = None
     try:
         port = announce_endpoint(listener)
-        # Reject an already occupied signer port; do not attach to an unknown service.
-        stage("signer_bind")
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 9099))
+        # The signer owns its OS-assigned port continuously from bind to exit.
         stage("signer_spawn")
         signer = subprocess.Popen(
-            [str(root / "jre/bin/java.exe"), "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+            [str(root / "jre/bin/java.exe"), "-Djava.net.preferIPv4Stack=true", "--add-opens", "java.base/java.lang=ALL-UNNAMED",
              "-Xmx512m", "-XX:+ExitOnOutOfMemoryError", "-cp", "unidbg-sign.jar",
-             "com.hongguo.sign.FqTrace", "serve", "9099"],
+             "com.hongguo.sign.FqTrace", "serve", "0"],
             cwd=root / "sign", stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -137,14 +229,15 @@ def main():
         reader = threading.Thread(target=drain_signer, args=(signer.stdout,), daemon=True)
         reader.start()
         stage("signer_ready")
-        wait_signer(signer)
+        signer_port = wait_signer(signer)
+        os.environ["SIGN_SERVER"] = f"http://127.0.0.1:{signer_port}"
         stage("provider_import")
         import server
         import uvicorn
         stage("api_run")
         config = uvicorn.Config(server.app, host="127.0.0.1", port=port,
                                 log_config=None, access_log=False, log_level="critical")
-        uvicorn.Server(config).run(sockets=[listener])
+        serve_owned_api(uvicorn.Server(config), listener, signer)
     finally:
         listener.close()
         if signer is not None:

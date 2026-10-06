@@ -1,169 +1,275 @@
 # -*- coding: utf-8 -*-
-"""红果桌面版本地维护: 前端补丁 (3x 倍速 + 清晰度可选)。
+"""红果桌面版前端补丁（版本无关）。
 
-- 纯文本替换, 不压缩; 打包见 tools/repack.py
-- 注入标识符与原 bundle 无冲突 (hqQ/hqB/hqV/hqL/hqFq/hqQuals/... 均 0 次)
-- 每处替换唯一命中, 否则直接失败
-- 产出后由 tools/check_frontend.js 做 node --check 语法校验
+上游每次发版后都能自动重新注入，不依赖压缩后的变量名：
+
+  * 结构固定、变量名会变的地方 —— 用带捕获组的正则回填原变量名；
+  * 需要跨多处共享同一标识符的地方 —— 先用「语义探针」在源码里反查
+    （如用 `X.defaultPlaybackRate=Y,Y.playbackRate=Y` 反查倍速状态变量）；
+  * 每处替换都断言命中次数，任何一处不符预期就整体失败，绝不产出半成品。
+
+用法：
+    python patches/patch_frontend.py <输入 app.js> [输出 app.js]
+默认 base/frontend/app.js -> src/frontend/app.js。
 """
-import io, os, sys, hashlib
+import io
+import os
+import re
+import sys
+import hashlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "src", "frontend", "app.js")
-ORIG = os.path.join(ROOT, "base", "frontend", "app.js")
 
 SPEED_OLD = "[.75,1,1.25,1.5,2]"
 SPEED_NEW = "[.75,1,1.25,1.5,2,2.5,3]"
 
-QUAL = (
+QUAL_HELPERS = (
     'function hqQuals(){return["auto","1080p","720p","540p","480p"]}'
     'function hqReadQual(){try{const r=localStorage.getItem("guoban:quality")||"auto";'
     'return hqQuals().includes(r)?r:"auto"}catch{return"auto"}}'
     'function hqWriteQual(r){try{localStorage.setItem("guoban:quality",r);return!0}catch{return!1}}'
+    'function hqStep(r){const e=[.75,1,1.25,1.5,2,2.5,3];'
+    'const t=document.querySelector(\'select[aria-label="播放速度"]\');'
+    'const i=t?e.indexOf(Number(t.value)):-1;'
+    'const n=(i<0?1:i)+r;return e[Math.max(0,Math.min(e.length-1,n))]}'
     'function hqWithQual(r,e){if(!e||e==="auto")return r;const t=new URL(r);'
     'if(t.pathname!=="/desktop/hls")return r;t.searchParams.set("quality",e);return t.toString()}'
+    'async function hqPost(run,aborted){const stop=()=>!!(aborted&&aborted());'
+    'for(let i=0;i<10;i++){let res;try{res=await run()}catch(e){'
+    'if(stop())throw e;await new Promise(k=>setTimeout(k,200*(i+1)));continue}'
+    'if(res.status!==503||stop())return res;'
+    'await new Promise(k=>setTimeout(k,200*(i+1)))}return run()}'
 )
 
 
-def sub_once(text, old, new, label):
-    n = text.count(old)
-    if n != 1:
-        raise SystemExit(f"[FAIL] {label}: expected 1 occurrence, found {n}")
-    return text.replace(old, new, 1)
+POST_RETRY = re.compile(
+    r'([\w$]+)=await ([\w$]+)\(([\w$().]+),\{method:"POST"\}\);'
+    r'if\(\1\.status===503&&([^{]+)\)\{'
+    r'if\(await new Promise\([^}]+?\),([^)]+)\)'
+    r'(return(?: null)?;)'
+    r'\1=await \2\(\3,\{method:"POST"\}\)\}'
+)
+
+
+class Fail(SystemExit):
+    pass
+
+
+class Patcher:
+    def __init__(self, text):
+        self.s = text
+        self.log = []
+
+    def sub(self, pattern, repl, label, count=1):
+        new, n = re.subn(pattern, repl, self.s)
+        if n != count:
+            raise Fail(f"[FAIL] {label}: 命中 {n} 次，预期 {count} 次\n  pattern={pattern}")
+        self.s = new
+        self.log.append(f"OK   {label}")
+
+    def probe(self, pattern, label, group=1):
+        m = re.search(pattern, self.s)
+        if not m:
+            raise Fail(f"[FAIL] 探针未命中: {label}\n  pattern={pattern}")
+        val = m.group(group)
+        self.log.append(f"OK   探针 {label} -> {val}")
+        return val
+
+    def insert(self, index, text, label):
+        self.s = self.s[:index] + text + self.s[index:]
+        self.log.append(f"OK   {label}")
+
+
+def patch(text):
+    p = Patcher(text)
+
+    # ===== 0) 先探测本次构建的变量名（上游每次发版都会变） =====
+    # 媒体元素（<video>）与播放器 refs 对象
+    media = p.probe(r'(\w+)\.volume=Math\.max\(0,Math\.min\(1,\1\.volume', "媒体元素")
+    refs = p.probe(r'(\w+)\.current\.seekTarget\?\?', "播放器 refs")
+    jsx = p.probe(r'(\w+)\.jsx\("span",\{className:"player-toolbar-spacer"\}\)', "JSX 工厂")
+    # 播放器组件里的函数：seek / 播放暂停 / 提示 / 倍速设置
+    seek = p.probe(r'&&(\w+)\(\(?' + re.escape(refs) + r'\.current\.seekTarget\?\?', "seek 函数")
+    toggle = p.probe(r'\w+\.key===" "&&(\w+)\(\{inputSource:"space"', "播放暂停函数")
+    # 倍速设置函数必须取「播放器组件形参」里的 onRate（组件内部作用域），
+    # 不能取调用处（那是外层 R0 的变量，组件内不可见）。
+    rate_set = p.probe(r'rate:\w+,onRate:(\w+),duration:', "倍速设置函数")
+    msg = p.probe(r'(\w+)\("播放中断，请重试当前集。?"\)', "提示函数")
+    # 倍速状态（供 [ ] 调档时读取当前值）
+    rate_var = p.probe(r'\w+\.defaultPlaybackRate=(\w+),\w+\.playbackRate=\1', "倍速状态变量")
+    # 键盘事件变量名（形如 `XX=Le=>{Le.altKey||...`）
+    keyev = p.probe(r'(\w+)=(\w+)=>\{\2\.altKey\|\|\2\.ctrlKey', "键盘事件参数", group=2)
+
+    # ===== 1) 倍速档位（工具栏 / 设置页 / 偏好校验 共 3 处） =====
+    p.sub(re.escape(SPEED_OLD), SPEED_NEW, "倍速档位", count=3)
+
+    # ===== 2) 注入清晰度辅助函数（放在 HLS URL 解析器之前） =====
+    m = re.search(r'function \w+\(\w+\)\{const \w+=new URL\(\w+\),\w+=\w+\.searchParams\.get\("api_key"\)', p.s)
+    if not m:
+        raise Fail("[FAIL] 未找到 HLS URL 解析器")
+    p.insert(m.start(), QUAL_HELPERS, "注入清晰度辅助函数")
+
+    # ===== 3) URL 参数白名单放行 quality =====
+    p.sub(r'\["api_key","series_id","ep"\]\.includes',
+          '["api_key","series_id","ep","quality"].includes',
+          "URL 白名单放行 quality")
+
+    # ===== 4) 工具栏清晰度下拉（放在倍速下拉之前） =====
+    p.sub(
+        r'(' + re.escape(jsx) + r'\.jsx\("span",\{className:"player-toolbar-spacer"\}\),)'
+        r'(' + re.escape(jsx) + r'\.jsx\("select",\{"aria-label":"播放速度",)',
+        r'\1'
+        + jsx + '.jsx("select",{"aria-label":"清晰度",title:"清晰度",value:hqQ,'
+        + 'onChange:ue=>{const ve=ue.target.value;hqL(ve)},'
+        + 'children:hqQuals().map(ue=>' + jsx + '.jsx("option",{value:ue,'
+        + 'children:ue==="auto"?"清晰度":ue},ue))}),'
+        + r'\2',
+        "工具栏清晰度下拉")
+
+    # ===== 5) 播放器组件接收清晰度 =====
+    p.sub(r'rate:(\w+),onRate:(\w+),duration:',
+          r'rate:\1,onRate:\2,quality:hqQ,onQuality:hqL,duration:',
+          "播放器组件形参")
+
+    # ===== 6) 播放器组件使用处传参 =====
+    p.sub(r'rate:(\w+),onRate:(\w+),onAcceptancePause:',
+          r'rate:\1,onRate:\2,quality:hqQ,onQuality:hqL,onAcceptancePause:',
+          "播放器组件传参")
+
+    # ===== 7) 播放器页：清晰度状态 + 切换回调 =====
+    p.sub(r'playbackRateInitially:(\w+)=1',
+          r'playbackRateInitially:\1=1,qualityInitially:hqFq="auto"',
+          "新增 qualityInitially 形参")
+    m = re.search(r'\[(' + re.escape(rate_var) + r'),(\w+)\]=(\w+)\.useState\((\w+)\)', p.s)
+    if not m:
+        raise Fail("[FAIL] 未找到倍速 useState")
+    hook, prop = m.group(3), m.group(4)
+    p.sub(r'(\[' + re.escape(rate_var) + r',\w+\]=' + re.escape(hook) + r'\.useState\(' + re.escape(prop) + r'\))',
+          r'\1,'
+          r'[hqQ,hqB]=' + hook + '.useState(()=>hqQuals().includes(hqFq)?hqFq:hqReadQual()),'
+          r'[hqV,hqW]=' + hook + '.useState(0),'
+          r'hqL=' + hook + '.useCallback(ce=>{const Le=hqQuals().includes(ce)?ce:"auto";'
+          r'hqWriteQual(Le),hqB(Le),hqW(ue=>ue+1)},[])',
+          "清晰度状态与切换回调")
+
+    # ===== 8) HLS 会话用带清晰度的 URL，并在切换时重建 =====
+    m = re.search(r'(\w+\([\w.$]+,)([\w.$]+\.streamUrl)(,\w+,\{onReady:)', p.s)
+    if not m:
+        raise Fail("[FAIL] 未找到 HLS 会话启动点")
+    p.sub(r'(\w+\([\w.$]+,)([\w.$]+\.streamUrl)(,\w+,\{onReady:)',
+          r'\1hqWithQual(\2,hqQ)\3', "HLS 会话 URL 带清晰度")
+    # 该 effect 的依赖数组补上清晰度
+    start = p.s.find("},[", m.start())
+    end = p.s.find("]", start)
+    p.s = p.s[:end] + ",hqQ,hqV" + p.s[end:]
+    p.log.append("OK   HLS 效果依赖 +hqQ,hqV")
+
+    # ===== 9) 预取下一集也用同一清晰度 =====
+    m = re.search(r'(\w+)=(\w+)\(([\w.$]+\.streamUrl)\),', p.s)
+    if not m:
+        raise Fail("[FAIL] 未找到预取点")
+    p.sub(r'(\w+)=(\w+)\(([\w.$]+\.streamUrl)\),',
+          r'\1=\2(hqWithQual(\3,hqQ)),', "预取带清晰度")
+    start = p.s.find("},[", m.start())
+    end = p.s.find("]", start)
+    p.s = p.s[:end] + ",hqQ,hqV" + p.s[end:]
+    p.log.append("OK   预取效果依赖 +hqQ,hqV")
+
+    # ===== 10) 设置页新增默认清晰度 =====
+    p.sub(r'(' + re.escape(jsx) + r'\.jsxs\("label",\{className:"settings-row",children:\[)'
+          r'(' + re.escape(jsx) + r'\.jsx\("span",\{children:"默认播放速度"\}\),)',
+          r'\1'
+          + jsx + '.jsx("span",{children:"默认清晰度"}),'
+          + jsx + '.jsx("select",{value:hqReadQual(),'
+          + 'onChange:o=>{hqWriteQual(o.target.value),e({...r})},'
+          + 'children:hqQuals().map(o=>' + jsx + '.jsx("option",{value:o,'
+          + 'children:o==="auto"?"自动（最高）":o},o))}),'
+          + r'\2',
+          "设置页默认清晰度")
+
+    # ===== 11) 打开播放器时传入已存偏好 =====
+    p.sub(r'(autoNextInitially:\w+\.autoNext,playbackRateInitially:\w+\.playbackRate,)',
+          r'\1qualityInitially:hqReadQual(),',
+          "传入 qualityInitially")
+
+    # ===== 12) 修复：点过按钮后按空格会重复激活该按钮 =====
+    p.sub(r'\.closest\("input,select,textarea,button,\[contenteditable=true\]"\)',
+          '.closest("input,select,textarea,[contenteditable=true]")',
+          "焦点守卫不再排除按钮")
+    p.sub(r'(' + re.escape(keyev) + r'\.key===" "&&)(\w+)\(\{inputSource:"space",inputTrusted:' + re.escape(keyev) + r'\.isTrusted\}\)',
+          r'\1(' + keyev + r'.target instanceof HTMLElement&&' + keyev + r'.target.closest("button")&&'
+          + keyev + r'.target.blur(),\2({inputSource:"space",inputTrusted:' + keyev + r'.isTrusted}))',
+          "空格键先清焦点")
+
+    # ===== 12.5) 503 重试改为指数退避多次重试 =====
+    # 上游只在 200ms 后重试一次; 切集瞬间编码池还在收尾,
+    # 一次重试很容易跌进「媒体准备失败」。
+    if ".status===503" in p.s:
+        p.sub(POST_RETRY.pattern,
+              r'\1=await hqPost(()=>\2(\3,{method:"POST"}),()=>\5);if(\5)\6',
+              "开场 POST 指数退避重试", count=2)
+
+    # ===== 13) 键盘白名单放行新按键 =====
+    p.sub(r'!\[" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T"\]',
+          '![" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T",'
+          '"[","]","{","}","<",">",",",".","PageUp","PageDown","Home","End",'
+          '"k","K","j","J","d","D","s","S","0","1","2","3","4","5","6","7","8","9"]',
+          "键盘白名单")
+
+    # ===== 14) 键盘快捷键分支（插在原有 "下一集" 分支之后，不碰收尾括号） =====
+    E, R, M, S, T, G = keyev, refs, media, seek, toggle, msg
+    anchor = (E + '.key.toLowerCase()==="n"&&' + R + '.current.canNext&&!'
+              + R + '.current.disabled&&' + R + '.current.onNext(),')
+    if p.s.count(anchor) != 1:
+        raise Fail(f"[FAIL] 键盘分支锚点命中 {p.s.count(anchor)} 次")
+    extra = (
+        '(' + E + '.key==="["||' + E + '.key==="{")&&' + rate_set + '(hqStep(-1)),'
+        + '(' + E + '.key==="]"||' + E + '.key==="}")&&' + rate_set + '(hqStep(1)),'
+        + '(' + E + '.key==="<"||' + E + '.key===",")&&' + S
+        + '(Math.max(0,(' + R + '.current.seekTarget??' + M + '.currentTime)-10)),'
+        + '(' + E + '.key===">"||' + E + '.key===".")&&' + S
+        + '((' + R + '.current.seekTarget??' + M + '.currentTime)+10),'
+        + E + '.key==="PageUp"&&' + S
+        + '(Math.max(0,(' + R + '.current.seekTarget??' + M + '.currentTime)-60)),'
+        + E + '.key==="PageDown"&&' + S
+        + '((' + R + '.current.seekTarget??' + M + '.currentTime)+60),'
+        + E + '.key==="Home"&&' + S + '(0),'
+        + E + '.key==="End"&&' + S + '(Number.isFinite(' + M + '.duration)?' + M + '.duration:0),'
+        + E + '.key.toLowerCase()==="k"&&' + T
+        + '({inputSource:"keyboard",inputTrusted:' + E + '.isTrusted}),'
+        + E + '.key.toLowerCase()==="j"&&' + R + '.current.canNext&&!'
+        + R + '.current.disabled&&' + R + '.current.onNext(),'
+        + E + '.key.toLowerCase()==="d"&&(' + M + '.muted=!' + M + '.muted),'
+        + E + '.key.toLowerCase()==="s"&&(' + M + '.loop=!' + M + '.loop,'
+        + G + '(' + M + '.loop?"循环播放已开启":"循环播放已关闭")),'
+        + '/^[0-9]$/.test(' + E + '.key)&&Number.isFinite(' + M + '.duration)&&'
+        + M + '.duration>0&&' + S + '(' + M + '.duration*(Number(' + E + '.key)/10)),'
+    )
+    p.s = p.s.replace(anchor, anchor + extra, 1)
+    p.log.append("OK   键盘快捷键分支")
+
+    return p
 
 
 def main():
-    src = ORIG
+    src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "base", "frontend", "app.js")
+    dst = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "src", "frontend", "app.js")
     s = io.open(src, encoding="utf-8").read()
-    orig_len = len(s)
-
-    # 1) 倍速: 工具栏 / 设置页 / 偏好校验共用同一数组
-    s = s.replace(SPEED_OLD, SPEED_NEW)
-    if s.count(SPEED_NEW) != 3:
-        raise SystemExit("[FAIL] speed array: expected 3 sites")
-
-    # 2) 清晰度工具函数 (定义在 Rx 之前)
-    s = sub_once(s,
-        'function Rx(r){const e=new URL(r),t=e.searchParams.get("api_key")||""',
-        QUAL + 'function Rx(r){const e=new URL(r),t=e.searchParams.get("api_key")||""',
-        "inject helpers")
-
-    # 3) Rx 白名单放行 quality
-    s = sub_once(s,
-        'some(a=>!["api_key","series_id","ep"].includes(a))',
-        'some(a=>!["api_key","series_id","ep","quality"].includes(a))',
-        "Rx allow quality")
-
-    # 4) 工具栏清晰度下拉
-    s = sub_once(s,
-        'x.jsx("span",{className:"player-toolbar-spacer"}),x.jsx("select",{"aria-label":"播放速度",',
-        'x.jsx("span",{className:"player-toolbar-spacer"}),'
-        'x.jsx("select",{"aria-label":"清晰度",title:"清晰度",value:hqQ,'
-        'onChange:ue=>{const ve=ue.target.value;hqL(ve)},disabled:i,'
-        'children:hqQuals().map(ue=>x.jsx("option",{value:ue,'
-        'children:ue==="auto"?"清晰度":ue},ue))}),'
-        'x.jsx("select",{"aria-label":"播放速度",',
-        "toolbar quality select")
-
-    # 5) DR 组件形参
-    s = sub_once(s, "rate:g,onRate:m,", "rate:g,onRate:m,quality:hqQ,onQuality:hqL,", "DR params")
-
-    # 6) DR 使用处传参
-    s = sub_once(s, "rate:pe,onRate:ye,onAcceptancePause:",
-                 "rate:pe,onRate:ye,quality:hqQ,onQuality:hqL,onAcceptancePause:", "DR usage")
-
-    # 7) R0 状态 (替换锚点本身不带尾部逗号; 原代码逗号保留)
-    s = sub_once(s, "[pe,ye]=O.useState(f)",
-        '[pe,ye]=O.useState(f),'
-        '[hqQ,hqB]=O.useState(()=>hqQuals().includes(hqFq)?hqFq:hqReadQual()),'
-        '[hqV,hqW]=O.useState(0),'
-        'hqL=O.useCallback(ce=>{const Le=hqQuals().includes(ce)?ce:"auto";'
-        'hqWriteQual(Le),hqB(Le),hqW(ue=>ue+1)},[])',
-        "R0 quality state")
-
-    # 8) R0 的 HLS 会话 URL + 依赖
-    s = sub_once(s, "const ut=Nw(ce,C.streamUrl,Be,", "const ut=Nw(ce,hqWithQual(C.streamUrl,hqQ),Be,", "HLS start")
-    s = sub_once(s, "},[C,ve,ft,o,v,E]),", "},[C,ve,ft,o,v,E,hqQ,hqV]),", "HLS deps")
-
-    # 9) 预取下一集
-    s = sub_once(s, "je=Ow(Zt.streamUrl),", "je=Ow(hqWithQual(Zt.streamUrl,hqQ)),", "prefetch")
-    s = sub_once(s, ",[C,ve,ft,dt,Rt,Ee]);", ",[C,ve,ft,dt,Rt,Ee,hqQ,hqV]);", "prefetch deps")
-
-    # 10) 设置页默认清晰度
-    s = sub_once(s,
-        'x.jsxs("label",{className:"settings-row",children:[x.jsx("span",{children:"默认播放速度"}),',
-        'x.jsxs("label",{className:"settings-row",children:['
-        'x.jsx("span",{children:"默认清晰度"}),'
-        'x.jsx("select",{value:hqReadQual(),'
-        'onChange:o=>{hqWriteQual(o.target.value),e({...r})},'
-        'children:hqQuals().map(o=>x.jsx("option",{value:o,'
-        'children:o==="auto"?"自动（最高）":o},o))})]}),'
-        'x.jsxs("label",{className:"settings-row",children:['
-        'x.jsx("span",{children:"默认播放速度"}),',
-        "settings quality row")
-
-    # 11) 快捷键: 在原有基础上补齐常用键
-    #     [ ] 调倍速  |  < > 跳转 10s  |  PageUp/PageDown 跳转 60s
-    #     k/j 播放暂停/下一集  |  0-9 按百分比跳转  |  s 循环播放  |  d 静音
-    KEY_OLD = (
-        '![" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T"].includes(Oe.key)'
-    )
-    KEY_NEW = (
-        '![" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T",'
-        '"[","]","{","}","<",">",",",".","PageUp","PageDown","Home","End","k","K","j","J","d","D","s","S",'
-        '"0","1","2","3","4","5","6","7","8","9"].includes(Oe.key)'
-    )
-    s = sub_once(s, KEY_OLD, KEY_NEW, "keydown allowlist")
-
-    HANDLERS_OLD = (
-        'Oe.key.toLowerCase()==="n"&&V.current.canNext&&!V.current.disabled&&V.current.onNext(),te())};'
-    )
-    HANDLERS_NEW = (
-        'Oe.key.toLowerCase()==="n"&&V.current.canNext&&!V.current.disabled&&V.current.onNext(),'
-        # --- 倍速: [ / ] 在档位间切换 (与工具栏下拉共用同一状态) ---
-        '(Oe.key==="["||Oe.key==="{")&&m(hqStep(-1)),'
-        '(Oe.key==="]"||Oe.key==="}")&&m(hqStep(1)),'
-        # --- 跳转: < > 10s, PageUp/PageDown 60s, Home/End 首尾 ---
-        '(Oe.key==="<"||Oe.key===",")&&N(Math.max(0,(V.current.seekTarget??ue.currentTime)-10)),'
-        '(Oe.key===">"||Oe.key===".")&&N((V.current.seekTarget??ue.currentTime)+10),'
-        'Oe.key==="PageDown"&&N((V.current.seekTarget??ue.currentTime)+60),'
-        'Oe.key==="PageUp"&&N(Math.max(0,(V.current.seekTarget??ue.currentTime)-60)),'
-        'Oe.key==="Home"&&N(0),'
-        'Oe.key==="End"&&N(Number.isFinite(ue.duration)?ue.duration:0),'
-        # --- 播放: k 播放/暂停, j 下一集 (n 已有), d 静音, s 循环 ---
-        'Oe.key.toLowerCase()==="k"&&W({inputSource:"keyboard",inputTrusted:Oe.isTrusted}),'
-        'Oe.key.toLowerCase()==="j"&&V.current.canNext&&!V.current.disabled&&V.current.onNext(),'
-        'Oe.key.toLowerCase()==="d"&&(ue.muted=!ue.muted),'
-        'Oe.key.toLowerCase()==="s"&&(ue.loop=!ue.loop,j(ue.loop?"循环播放已开启":"循环播放已关闭")),'
-        # --- 数字键: 按百分比跳转 ---
-        '/^[0-9]$/.test(Oe.key)&&Number.isFinite(ue.duration)&&ue.duration>0'
-        '&&N(ue.duration*(Number(Oe.key)/10)),'
-        'te())};'
-    )
-    s = sub_once(s, HANDLERS_OLD, HANDLERS_NEW, "keydown handlers")
-
-    # hqStep: 在清晰度/倍速共用档位之外, 供 [ ] 调倍速
-    STEP_OLD = 'function hqWithQual(r,e){if(!e||e==="auto")return r;const t=new URL(r);'
-    STEP_NEW = (
-        'function hqStep(r){const e=[.75,1,1.25,1.5,2,2.5,3];'
-        'const t=document.querySelector(\'select[aria-label="播放速度"]\');'
-        'const i=t?e.indexOf(Number(t.value)):-1;'
-        'const n=(i<0?1:i)+r;return e[Math.max(0,Math.min(e.length-1,n))]}'
-        'function hqWithQual(r,e){if(!e||e==="auto")return r;const t=new URL(r);'
-    )
-    s = sub_once(s, STEP_OLD, STEP_NEW, "hqStep helper")
-
-    # 11) 打开播放器时传入已存偏好
-    s = sub_once(s,
-        "autoNextInitially:e.autoNext,playbackRateInitially:e.playbackRate,resolve:je.source===",
-        "autoNextInitially:e.autoNext,playbackRateInitially:e.playbackRate,qualityInitially:hqReadQual(),resolve:je.source===",
-        "pass qualityInitially")
-    s = sub_once(s, "playbackRateInitially:f=1,observeMedia:d",
-                 'playbackRateInitially:f=1,qualityInitially:hqFq="auto",observeMedia:d', "R0 prop")
-
-    io.open(SRC, "w", encoding="utf-8", newline="").write(s)
-    print(f"[OK] app.js: {orig_len} -> {len(s)} bytes (+{len(s)-orig_len})")
-    print("[OK] sha256:", hashlib.sha256(s.encode("utf-8")).hexdigest())
+    p = patch(s)
+    io.open(dst, "w", encoding="utf-8", newline="").write(p.s)
+    # app.css / index.html 不需要改内容，但要跟随基线一起同步（上游发版会变）。
+    src_dir = os.path.dirname(src)
+    dst_dir = os.path.dirname(dst)
+    for extra in ("app.css", "index.html"):
+        cand = os.path.join(src_dir, extra)
+        if os.path.isfile(cand):
+            io.open(os.path.join(dst_dir, extra), "w", encoding="utf-8", newline="").write(
+                io.open(cand, encoding="utf-8").read())
+            print("OK   同步", extra)
+    for line in p.log:
+        print(line)
+    print(f"[OK] {os.path.basename(dst)}: {len(p.s)} bytes "
+          f"sha256={hashlib.sha256(p.s.encode()).hexdigest()[:16]}")
 
 
 if __name__ == "__main__":

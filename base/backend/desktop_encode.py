@@ -4,7 +4,7 @@ from pathlib import Path
 import uuid
 
 
-def encode_h264(source, cancelled=None):
+def encode_h264(source):
     import av
     source = Path(source)
     destination = source.with_name(source.stem + ".desktop-h264-v1.mp4")
@@ -29,9 +29,6 @@ def encode_h264(source, cancelled=None):
                     audio[stream.index] = writer.add_stream_from_template(stream)
                     audio[stream.index].codec_context.codec_tag = "mp4a"
                 for packet in reader.demux():
-                    # 本地维护: 切集/关播放器时立刻停止转码, 不空占编码槽位。
-                    if cancelled is not None and cancelled():
-                        raise ValueError("Desktop encode cancelled")
                     if packet.stream.index == original.index:
                         for frame in packet.decode():
                             for encoded in video.encode(frame):

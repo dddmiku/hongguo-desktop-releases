@@ -45,3 +45,16 @@ tools/syn2.js
 tools/syn3.js
 tools/syn4.js
 tools/syntax_check.js
+
+# 本轮逆向/验证中间产物（不入库）
+_txn/
+_work/
+_v109/
+state.json
+auto_patch.log
+tools/_*.js
+tools/_*.ps1
+tools/*.js
+src/frontend/_*.mjs
+verify/*.before-rollback
+verify/repro/_rbtest/
