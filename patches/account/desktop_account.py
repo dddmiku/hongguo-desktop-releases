@@ -187,15 +187,23 @@ def load_device():
         except OSError:
             pass
         return synced
-    # 兜底：沿用已存文件（即便未标记 registered），最后才随机
+    # 兜底：沿用已存文件（即便未标记 registered）
     try:
         data = json.loads(io.open(DEVICE_PATH, encoding="utf-8").read())
         if isinstance(data, dict) and data.get("device_id"):
             return data
     except Exception:
         pass
+    # 最后才随机 —— 但要标清楚「未注册」。
+    # 2026-10-07 实测：随机生成的 device_id 在字节的注册服务里没有记录，
+    # 登录会被判为异常客户端，稳定返回 error_code=7（系统繁忙）。
+    # 模拟器里那台真实注册过的设备同样条件下返回 1202/1203（正常进入校验）。
+    # 所以调用方应优先用 registered=True 的设备；这里只作最后兜底。
     import uuid
-    return {"device_id": _digits(16), "iid": _digits(16), "cdid": str(uuid.uuid4())}
+    log_event("device_unregistered",
+              note="随机设备未经注册，登录可能被判异常客户端")
+    return {"device_id": _digits(16), "iid": _digits(16),
+            "cdid": str(uuid.uuid4()), "registered": False, "source": "random"}
 
 
 def passport_query():
