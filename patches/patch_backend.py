@@ -182,6 +182,110 @@ SRC_SIG_NEW = 'def _desktop_source(series_id, episode, quality="desktop-resoluti
 SRC_CALL_OLD = "        return encode_h264(decrypted)"
 SRC_CALL_NEW = "        return encode_h264(decrypted, cancelled)"
 
+# ---- 本地维护: 看过的集自动清理缓存 ----
+# 上游只写不清，缓存会无限增长（实测曾达 28.8GB）。
+# 清理策略：一集播完就把它的两份缓存（解密源 + 转码产物）删掉。
+CLEANUP_BLOCK = '''
+
+
+# ---- 本地维护: 看过的集自动清理缓存 ----
+def _hq_cleanup_episode(series_id, episode):
+    """删掉这一集的本地缓存（解密源 + H.264 转码产物）。
+
+    定位方式：先用章节接口把 episode 换成 vid，再按 vid 删。
+    只删命名模式匹配的文件，绝不扫目录、绝不删目录本身。
+    """
+    import glob as _g
+    try:
+        _, episodes = H.get_episodes(series_id)
+        target = next((it for it in episodes if it.get("index") == episode), None)
+        if not target:
+            return 0
+        vid = str(target.get("vid", ""))
+        if not re.fullmatch(r"[0-9]{8,24}", vid):
+            return 0
+        removed = 0
+        for pattern in (f"{vid}_*.mp4", f"{vid}_*.desktop-h264-v1.mp4"):
+            for path in _g.glob(os.path.join(STREAM_CACHE, pattern)):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
+def _hq_cache_cap(max_bytes=0, keep_files=8):
+    """控制本地缓存规模。
+
+    1) 按最后修改时间保留最近 keep_files 个文件，其余删除。
+       播放器一次只看一集，预取最多提前 2 集，
+       所以被淘汰的文件必然是看过的集数。
+    2) 若总量仍超过 max_bytes，继续从最旧的删。
+
+    只删匹配 *.mp4 的普通文件，不扫目录、不删目录。
+    """
+    import glob as _g
+    try:
+        files = []
+        total = 0
+        for path in _g.glob(os.path.join(STREAM_CACHE, "*.mp4")):
+            try:
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    files.append((os.path.getmtime(path), size, path))
+                    total += size
+            except OSError:
+                pass
+        if not files:
+            return 0
+        files.sort(key=lambda it: it[0], reverse=True)
+        removed = 0
+        for _, size, path in files[keep_files:]:
+            try:
+                os.remove(path)
+                total -= size
+                removed += 1
+            except OSError:
+                pass
+        if max_bytes and total > max_bytes:
+            target = int(max_bytes * 0.75)
+            for _, size, path in files[:keep_files]:
+                if total <= target:
+                    break
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        total -= size
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
+
+@app.get("/desktop/cleanup")
+def desktop_cleanup(series_id: str, ep: int):
+    """播放器告知某集已经看完，删掉它的本地缓存。"""
+    if not re.fullmatch(r"[0-9]{8,24}", str(series_id)) or not 1 <= ep <= 100000:
+        raise HTTPException(400, "Invalid episode identity")
+    return {"removed": _hq_cleanup_episode(series_id, ep)}
+'''
+
+CLEANUP_CALL_OLD = "        return encode_h264(decrypted, cancelled)"
+CLEANUP_CALL_NEW = (
+    "        result = encode_h264(decrypted, cancelled)\n"
+    "        # 本地维护: 控制缓存上限（默认 4GB）\n"
+    "        _hq_cache_cap(int(os.environ.get(\"HONGGUO_CACHE_MAX_BYTES\") or 0),\n"
+    "                      int(os.environ.get(\"HONGGUO_CACHE_KEEP_FILES\") or 8))\n"
+    "        return result"
+)
+
 
 
 class Fail(SystemExit):
@@ -271,7 +375,7 @@ def patch_server(src_dir, out_dir):
     p_in = os.path.join(src_dir, "server.py")
     p_out = os.path.join(out_dir, "server.py")
     s = io.open(p_in, encoding="utf-8").read()
-    if "encode_h264(decrypted)" in s:
+    if "encode_h264(decrypted)" in s and "_hq_cleanup_episode" in s:
         io.open(p_out, "w", encoding="utf-8", newline="").write(s)
         print("OK   server.py 已打过补丁（跳过）")
         return
@@ -293,8 +397,12 @@ def patch_server(src_dir, out_dir):
         raise Fail("[FAIL] _desktop_source 未匹配到返回语句")
     s = s[:m.start()] + (SRC_SIG_NEW + "\n") \
         + new + "\n\n" + s[m.end():]
+    # 缓存上限：每次取源后回收超出部分
+    s = sub_once(s, re.escape(CLEANUP_CALL_OLD), CLEANUP_CALL_NEW, "缓存上限回收")
+    # 清理接口 + 帮助函数：追加到文件末尾
+    s = s.rstrip("\n") + "\n" + CLEANUP_BLOCK
     io.open(p_out, "w", encoding="utf-8", newline="").write(s)
-    print("OK   server.py  (清晰度选轨 + H.264 缓存直通)")
+    print("OK   server.py  (清晰度 + 缓存直通 + 看过自动清理)")
 
 
 def patch_encode(src_dir, out_dir):

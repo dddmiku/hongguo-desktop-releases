@@ -538,7 +538,11 @@ if os.environ.get("HONGGUO_SESSION_API_KEY") and os.environ.get("HONGGUO_HLS_WOR
         # 交给 HLS 编码器已转码的 H.264 缓存:
         # stream-copy 约 0.16s, 而重编码 HEVC 约 3.8s。
         from desktop_encode import encode_h264
-        return encode_h264(decrypted, cancelled)
+        result = encode_h264(decrypted, cancelled)
+        # 本地维护: 控制缓存上限（默认 4GB）
+        _hq_cache_cap(int(os.environ.get("HONGGUO_CACHE_MAX_BYTES") or 0),
+                      int(os.environ.get("HONGGUO_CACHE_KEEP_FILES") or 8))
+        return result
 
     _desktop_jobs = HlsJobs(os.environ["HONGGUO_HLS_WORK_DIR"], _desktop_source)
     app.include_router(make_router(_desktop_jobs, _keys.is_valid))
@@ -554,3 +558,93 @@ if __name__ == "__main__":
     import uvicorn
     # 默认只绑本机(脱机直连由同机 xinge 走 127.0.0.1 调); 需对外可设 BIND_HOST=0.0.0.0
     uvicorn.run(app, host=os.environ.get("BIND_HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))
+
+
+
+# ---- 本地维护: 看过的集自动清理缓存 ----
+def _hq_cleanup_episode(series_id, episode):
+    """删掉这一集的本地缓存（解密源 + H.264 转码产物）。
+
+    定位方式：先用章节接口把 episode 换成 vid，再按 vid 删。
+    只删命名模式匹配的文件，绝不扫目录、绝不删目录本身。
+    """
+    import glob as _g
+    try:
+        _, episodes = H.get_episodes(series_id)
+        target = next((it for it in episodes if it.get("index") == episode), None)
+        if not target:
+            return 0
+        vid = str(target.get("vid", ""))
+        if not re.fullmatch(r"[0-9]{8,24}", vid):
+            return 0
+        removed = 0
+        for pattern in (f"{vid}_*.mp4", f"{vid}_*.desktop-h264-v1.mp4"):
+            for path in _g.glob(os.path.join(STREAM_CACHE, pattern)):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
+def _hq_cache_cap(max_bytes=0, keep_files=8):
+    """控制本地缓存规模。
+
+    1) 按最后修改时间保留最近 keep_files 个文件，其余删除。
+       播放器一次只看一集，预取最多提前 2 集，
+       所以被淘汰的文件必然是看过的集数。
+    2) 若总量仍超过 max_bytes，继续从最旧的删。
+
+    只删匹配 *.mp4 的普通文件，不扫目录、不删目录。
+    """
+    import glob as _g
+    try:
+        files = []
+        total = 0
+        for path in _g.glob(os.path.join(STREAM_CACHE, "*.mp4")):
+            try:
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    files.append((os.path.getmtime(path), size, path))
+                    total += size
+            except OSError:
+                pass
+        if not files:
+            return 0
+        files.sort(key=lambda it: it[0], reverse=True)
+        removed = 0
+        for _, size, path in files[keep_files:]:
+            try:
+                os.remove(path)
+                total -= size
+                removed += 1
+            except OSError:
+                pass
+        if max_bytes and total > max_bytes:
+            target = int(max_bytes * 0.75)
+            for _, size, path in files[:keep_files]:
+                if total <= target:
+                    break
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        total -= size
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        return 0
+
+
+
+@app.get("/desktop/cleanup")
+def desktop_cleanup(series_id: str, ep: int):
+    """播放器告知某集已经看完，删掉它的本地缓存。"""
+    if not re.fullmatch(r"[0-9]{8,24}", str(series_id)) or not 1 <= ep <= 100000:
+        raise HTTPException(400, "Invalid episode identity")
+    return {"removed": _hq_cleanup_episode(series_id, ep)}

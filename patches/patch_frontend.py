@@ -19,7 +19,6 @@ import sys
 import hashlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 SPEED_OLD = "[.75,1,1.25,1.5,2]"
 SPEED_NEW = "[.75,1,1.25,1.5,2,2.5,3]"
 
@@ -173,6 +172,21 @@ PREFETCH_RESET_NEW = (
     "et.current.forEach(Vt=>Vt.preparation.dispose()),et.current.clear(),"
 )
 
+
+# ---- 本地维护: 看完一集就让后端清掉它的缓存 ----
+# 后端只写不清会让 stream-cache 无限增长（实测 45GB/903 个文件）。
+# 在 onEnded 里发一个 DELETE，失败也不影响播放。
+
+CLEANUP_CALL_OLD = "C.episode===Pt&&W(!0),ve&&C.episode<Pt&&"
+# 自包含：从 C.streamUrl 取 origin 与 api_key，不依赖外部标识符。
+CLEANUP_CALL_NEW = (
+    "C.episode===Pt&&W(!0),"
+    "(()=>{try{const u=new URL(C.streamUrl);"
+    "fetch(`${u.origin}/desktop/cleanup?series_id=${encodeURIComponent(C.seriesId)}&ep=${C.episode}`,"
+    "{method:\"GET\",headers:{\"x-api-key\":u.searchParams.get(\"api_key\")||\"\"},"
+    "credentials:\"omit\",redirect:\"error\",keepalive:!0}).catch(()=>{})}catch(e){}})(),"
+    "ve&&C.episode<Pt&&"
+)
 
 class Fail(SystemExit):
     pass
@@ -355,6 +369,8 @@ def patch(text):
     p.sub(re.escape(PREFETCH_USE_OLD), PREFETCH_USE_NEW, "从 Map 取预取")
     p.sub(re.escape(PREFETCH_RESET_OLD), PREFETCH_RESET_NEW, "换集时清空预取")
 
+    # ===== 12.9) 看完一集后通知后端清理该集缓存 =====
+    p.sub(re.escape(CLEANUP_CALL_OLD), CLEANUP_CALL_NEW, "看完自动清理缓存")
     # ===== 13) 键盘白名单放行新按键 =====
     p.sub(r'!\[" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T"\]',
           '![" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T",'
