@@ -1,0 +1,47 @@
+# 本地逆向/构建中间产物（不入库）
+_extract/
+_src/
+_upstream/
+_backup/
+
+# 运行时数据
+*.pyc
+__pycache__/
+*.partial
+
+# 构建输出
+dist/*.exe
+dist/repack-report.json
+
+# 逆向/调试期间的一次性脚本（未纳入维护）
+tools/balance.js
+tools/cdp_console.js
+tools/cdp_qual.js
+tools/cdp_timing.js
+tools/chk.js
+tools/chk2.js
+tools/collide.js
+tools/collide2.js
+tools/collide3.js
+tools/d2.js
+tools/diff1.js
+tools/diffregions.js
+tools/findat.js
+tools/findat2.js
+tools/findat3.js
+tools/findcomma.js
+tools/findkeys.js
+tools/findkeys2.js
+tools/findqual.js
+tools/inspect.js
+tools/inspect2.js
+tools/show2.js
+tools/showfail.js
+tools/stepwise.js
+tools/stepwise2.js
+tools/stepwise3.js
+tools/stepwise4.js
+tools/syn2.js
+tools/syn3.js
+tools/syn4.js
+tools/syntax_check.js
