@@ -425,8 +425,14 @@ def _call(method, path, body=None, extra=None, session=None, host=None, form=Non
         headers["lc"] = "101"
         headers["x-vc-bdturing-sdk-version"] = "4.0.3.cn"
         headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
-        if data is not None:
-            headers["x-ss-stub"] = hashlib.md5(data).hexdigest().upper()
+        # x-ss-stub 不能是 md5(请求体)！
+        # 2026-10-07 交替对照（各测 2 次，结果稳定）：
+        #   x-ss-stub = md5(请求体)     -> error_code=7（被拦）
+        #   x-ss-stub = 随机 32 位 hex  -> 1203（通过，进入验证码校验）
+        # 上游文档写的「x-ss-stub = body 的 MD5」对护照接口不成立；
+        # 服务端会拒绝 stub 恰好等于请求体 md5 的请求。这里用随机值。
+        import secrets as _secrets
+        headers["x-ss-stub"] = _secrets.token_hex(16).upper()
         # csrf：优先用会话里的；没有就从 cookie 里抠出来。
         csrf = ""
         cookie_text = headers.get("cookie") or ""
