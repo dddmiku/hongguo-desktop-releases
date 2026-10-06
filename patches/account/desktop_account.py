@@ -622,7 +622,12 @@ def public_session(session=None):
 
 # ---- 观看进度 / 历史 ------------------------------------------------------
 def sync_progress(series_id, episode, total=0, position=0, duration=0, series=None):
-    """把桌面端的观看进度上报到账号（手机“历史”页立即可见）。"""
+    """把桌面端的观看进度上报到账号（手机“历史”页立即可见）。
+
+    合并规则：同一剧集「取更靠前的进度」，不允许把云端进度改小。
+    否则会出现：手机看到 520 集，PC 本地停在 500 集，PC 一上报就把 520 覆盖成 500。
+    所以上报前先读云端，只有本地确实更靠前时才写。
+    """
     if not is_logged_in():
         return {"ok": False, "error": "未登录红果账号"}
     series_id = str(series_id)
@@ -631,6 +636,24 @@ def sync_progress(series_id, episode, total=0, position=0, duration=0, series=No
     episode = int(episode)
     if not 1 <= episode <= 100000:
         return {"ok": False, "error": "集号不合法"}
+    # 先比云端：本地不更靠前就跳过，避免把多端的进度改小。
+    try:
+        cloud = remote_progress(series_id)
+    except Exception:
+        cloud = {"ok": False}
+    if cloud.get("ok"):
+        cloud_ep = int(cloud.get("episode") or 0)
+        cloud_pos = int(cloud.get("position") or 0)
+        if cloud_ep > episode:
+            log_event("progress_skipped", reason="cloud_ahead",
+                      cloud_episode=cloud_ep, local_episode=episode)
+            return {"ok": True, "skipped": True, "episode": cloud_ep,
+                    "reason": "云端进度更靠前，保持不变"}
+        if cloud_ep == episode and cloud_pos > int(max(0, position)):
+            log_event("progress_skipped", reason="cloud_position_ahead",
+                      cloud_episode=cloud_ep, local_position=int(max(0, position)))
+            return {"ok": True, "skipped": True, "episode": cloud_ep,
+                    "reason": "云端播放位置更靠前，保持不变"}
     vid = ""
     try:
         _, episodes = H.get_episodes(series_id)
@@ -671,6 +694,34 @@ def sync_progress(series_id, episode, total=0, position=0, duration=0, series=No
                 "error": j.get("message") or "上报失败"}
     fails = ((j.get("data") or {}).get("update_fail_datas") or []) if isinstance(j.get("data"), dict) else []
     return {"ok": not fails, "code": 0, "episode": episode, "failed": len(fails)}
+
+
+def _history_raw(limit=30):
+    """读一次云端历史原始列表（内部用）。"""
+    r = _call("GET", "/reading/bookapi/read_history/list/v", extra={
+        "book_type": "2", "offset": "0", "limit": str(int(limit)),
+        "query_soft_deleted": "false", "is_first_load": "false",
+        "last_min_read_timestamp_ms": "0", "full_field": "false"})
+    return _json(r)
+
+
+def remote_progress(series_id):
+    """查单部剧在云端的进度（用于「取最新」合并，避免把进度改小）。"""
+    if not is_logged_in():
+        return {"ok": False, "error": "未登录红果账号"}
+    series_id = str(series_id)
+    if not re.fullmatch(r"[0-9]{8,24}", series_id):
+        return {"ok": False, "error": "剧集标识不合法"}
+    j = _history_raw(limit=100)
+    if j.get("code") not in (0, "0"):
+        return {"ok": False, "code": j.get("code"), "error": j.get("message")}
+    for it in (((j.get("data") or {}).get("data_list")) or []):
+        if str(it.get("book_id_str") or it.get("book_id") or "") == series_id:
+            return {"ok": True,
+                    "episode": int(it.get("vid_index") or it.get("chapter_index") or 0),
+                    "position": int(it.get("current_play_position") or 0),
+                    "updatedAt": int(it.get("read_timestamp_ms") or 0)}
+    return {"ok": True, "episode": 0, "position": 0, "updatedAt": 0}
 
 
 def remote_history(limit=30):
@@ -734,7 +785,41 @@ def remote_favorites():
             "contentType": int(it.get("content_type") or 0),
             "addedAt": int(it.get("collect_time") or it.get("modify_time") or 0),
         })
+    # 书架接口只给 id，没有封面/标题。
+    # 前端卡片必须要有 cover（还要能解析出封面地址），否则收藏页只有文字没有图。
+    # 所以这里用剧集接口把封面和标题补齐。
+    ids = [x["seriesId"] for x in items if x["seriesId"]]
+    if ids:
+        meta = _series_meta(ids)
+        for x in items:
+            m = meta.get(x["seriesId"]) or {}
+            x["title"] = m.get("title") or ""
+            x["cover"] = m.get("cover") or ""
+            x["episodeCount"] = int(m.get("episodeCount") or 0)
     return {"ok": True, "items": items}
+
+
+def _series_meta(series_ids):
+    """批量取剧集的标题/封面/集数（收藏补封面用）。取不到就返回空，不影响主流程。"""
+    out = {}
+    ids = [str(s) for s in series_ids if re.fullmatch(r"[0-9]{8,24}", str(s or ""))]
+    if not ids:
+        return out
+    try:
+        # get_episodes_batch 返回 (剧集表, ...)，剧集表是 {series_id: 剧集信息}。
+        batch = H.get_episodes_batch(ids)
+        series_map = batch[0] if isinstance(batch, (list, tuple)) and batch else batch
+        for sid, meta in (series_map or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            out[str(sid)] = {
+                "title": meta.get("title") or "",
+                "cover": meta.get("cover") or "",
+                "episodeCount": int(meta.get("episode_cnt") or meta.get("episodeCount") or 0),
+            }
+    except Exception:
+        pass
+    return out
 
 # ---- 从模拟器同步登录态 ---------------------------------------------------
 def _adb():

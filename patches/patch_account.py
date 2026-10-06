@@ -77,6 +77,26 @@ JSON.stringify({userName:s.userName||"",uid:s.uid||"",at:Date.now()}))}catch(e){
 function hqDropStatus(){try{localStorage.removeItem("guoban:acct")}catch(e){}}
 function hqCachedStatus(){try{const v=JSON.parse(localStorage.getItem("guoban:acct")||"null");
 return v&&v.userName?{loggedIn:!0,userName:v.userName,uid:v.uid||"",cached:!0}:{loggedIn:!1}}catch(e){return{loggedIn:!1}}}
+
+// 账号隔离：缓存必须绑定账号身份。
+// 之前用户名和「从手机合并进来的历史/收藏」都没有账号标记，
+// 换号后会把上一个号的名字和记录继续显示出来（甚至可能同步过去）。
+// 这里在拿到真实账号状态时对比 uid，一旦变化就清掉上一个号的痕迹。
+function hqCachedUid(){try{return localStorage.getItem("guoban:acctUid")||""}catch(e){return ""}}
+function hqOnAccount(s){
+if(!s||!s.loggedIn)return;
+const uid=String(s.uid||"");const prev=hqCachedUid();
+if(uid&&uid!==prev){
+// 账号变了：丢掉上一个号带进来的条目，再重新合并。
+try{localStorage.setItem("guoban:acctUid",uid)}catch(e){}
+const w=window.__hqLib;
+if(w&&w.setHist&&w.setFav&&prev){
+w.setHist(function(list){return (list||[]).filter(function(x){return !x.fromPhone})});
+w.setFav(function(list){return (list||[]).filter(function(x){return !x.fromPhone})});
+hqMergedOnce=!1;
+}
+}
+hqSaveStatus(s)}
 var hqNeedPlayHint="请先播放任意一集，再回到这里登录（本机服务凭据只在播放时下发）。";
 // 本机服务地址每次启动都会变，所以端口以 get_validation_status 的实时值为准；
 // 密钥由后端在播放链接里下发，播放一次即可拿到。
@@ -103,8 +123,9 @@ if(r.favoritesOk&&Array.isArray(r.favorites)&&r.favorites.length){
 const seen=new Set((localFav||[]).map(function(x){return String(x.seriesId)}));
 const merged=(localFav||[]).slice();
 r.favorites.forEach(function(f){const id=String(f.seriesId||"");
-if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:"",
-cover:"",tags:[],actors:[],intro:"",episodeCount:0,hotText:"",fromPhone:!0})}});
+if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:f.title||"",
+cover:f.cover||"",tags:[],actors:[],intro:"",episodeCount:Number(f.episodeCount)||0,
+hotText:"",fromPhone:!0})}});
 if(merged.length!==(localFav||[]).length)setFav(merged)}
 if(r.historyOk&&Array.isArray(r.history)&&r.history.length){
 const seen=new Set((localHist||[]).map(function(x){return String(x.seriesId)}));
@@ -125,26 +146,48 @@ return add.length?(prev||[]).concat(add):prev})}
 }
 }catch(e){}}
 
-// 账号页确认「本机 API 已连通」后，补一次合并。
-// 打开应用时的首次合并可能还没有凭据（凭据要播放过一集才下发），
-// 这里等凭据到位后再合并一次，保证手机端历史/收藏一定进得来。
+// 合并入口。
+// 之前只在「首次加载」跑一次（hqMergedOnce 标志），
+// 导致看完一集再进历史页看到的还是旧记录，必须手动点「历史」才刷新。
+// 现在改成可重复调用：进历史页 / 切回前台 / 账号页确认连通后都会拉一次。
 var hqMergedOnce=!1;
 function hqMergeOnce(){if(hqMergedOnce)return;const w=window.__hqLib;
 if(!w||!w.setFav||!w.setHist)return;hqMergedOnce=!0;
 return hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist)}
+// 强制刷新（忽略一次性标志），用于进入历史页 / 切回前台。
+var hqRefreshing=!1;
+async function hqRefreshLibrary(){
+const w=window.__hqLib;if(!w||!w.setFav||!w.setHist)return;
+if(hqRefreshing)return;hqRefreshing=!0;
+try{
+if(!hqApi())await hqEnsureApi();
+if(!(await hqApiAlive()))return;
+await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist);
+hqMergedOnce=!0;
+}catch(e){}finally{hqRefreshing=!1}}
+// 进入历史页时刷新一次（切页由下面的 hook 触发）。
+if(!window.__hqRefreshHooked){
+window.__hqRefreshHooked=!0;
+window.addEventListener("focus",function(){void hqRefreshLibrary()});
+document.addEventListener("visibilitychange",function(){
+if(!document.hidden)void hqRefreshLibrary()});
+}
 '''
 
 PANEL = r"""
 function hqAccountPanel(){const[n,a]=REACT.useState(null),[o,c]=REACT.useState(""),
 [d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState(""),
-[hqCd,hqSetCd]=REACT.useState(0);
+[hqCd,hqSetCd]=REACT.useState(0),[hqTryAt,hqSetTryAt]=REACT.useState(0);
+// 登录尝试节流：连续失败会被服务端升级成「为保证账号安全，暂不支持此操作」(2046)。
+// 之前登录按钮没有任何节流，连点就会触发，所以这里失败后强制冷却。
+// 注意：必须并进上面那条 const 声明（分号隔开会变成给未声明变量赋值，直接白屏）。
 REACT.useEffect(()=>{let x=!0,stop=!1;
 async function load(){
 if(!hqApi())await hqEnsureApi();
 const alive=await hqApiAlive();
 if(!alive){hqForgetApi();if(x){a(hqCachedStatus());v(hqNeedPlayHint),T("")}return!1}
 const A=await hqAcctCall("/desktop/account/status",null,"GET",null);
-if(x&&A){a(A);hqSaveStatus(A);v(""),T("");hqMergeOnce()}return!0}
+if(x&&A){a(A);hqOnAccount(A);v(""),T("");hqMergeOnce()}return!0}
 (async()=>{
 if(await load())return;
 // 凭据只在播放时下发。这里自动等：窗口重新获得焦点或每 3 秒重试一次，
@@ -159,7 +202,16 @@ return()=>{stop=!0;window.removeEventListener("focus",onFocus);
 window.removeEventListener("visibilitychange",onFocus)}})();
 return()=>{x=!1;stop=!0}},[]);
 REACT.useEffect(()=>{if(hqCd<=0)return;const x=window.setTimeout(()=>hqSetCd(A=>A-1),1000);return()=>window.clearTimeout(x)},[hqCd]);
+REACT.useEffect(()=>{if(hqTryAt<=0)return;const x=window.setTimeout(()=>hqSetTryAt(A=>A-1),1000);return()=>window.clearTimeout(x)},[hqTryAt]);
 function hqErr(e){return e&&e.message?String(e.message).slice(0,200):"请求失败"}
+// 把服务端错误码翻译成人话，避免用户反复重试把风控点着。
+function hqHint(msg){const s=String(msg||"");
+if(s.indexOf("2046")>=0||s.indexOf("为保证账号安全")>=0)
+return "服务端已暂时限制本机登录（多次失败后触发）。请等 10-30 分钟再试，期间不要重复提交。";
+if(s.indexOf("访问太频繁")>=0||s.indexOf("系统繁忙")>=0)
+return s+"（已自动冷却 30 秒，请稍后再试）";
+if(s.indexOf("验证码")>=0)return s+"（请确认验证码是否正确、是否已过期）";
+return s}
 async function hqPost(path,q){const v=hqApi();if(!v)throw new Error(hqNeedPlayHint);
 const u=new URL(v.origin+path);Object.entries(q).forEach(([k,x])=>u.searchParams.set(k,x));
 let r;try{
@@ -175,7 +227,10 @@ async function L(){m(!0),v("");try{const x=await hqPost("/desktop/account/send_c
 hqSetCd(Number(x&&x.retryTime)>0?Number(x.retryTime):60);
 v("验证码已发送，请查看手机短信。"),T("")}catch(e){v("发送失败："+hqErr(e)),T("error")}finally{m(!1)}}
 async function R(){m(!0),v("");try{const x=await hqPost("/desktop/account/login",{mobile:o,code:d});
-if(x&&x.loggedIn){a(x),hqSaveStatus(x),f(""),v("登录成功，观看进度与收藏会同步到手机。"),T("")}else{v("登录失败：响应异常"),T("error")}}catch(e){v("登录失败："+hqErr(e)),T("error")}finally{m(!1)}}
+if(x&&x.loggedIn){a(x),hqSaveStatus(x),f(""),hqSetTryAt(0),v("登录成功，观看进度与收藏会同步到手机。"),T("")}
+else{v("登录失败：响应异常"),T("error")}}
+catch(e){const raw=hqErr(e);hqSetTryAt(30);v("登录失败："+hqHint(raw)),T("error")}
+finally{m(!1)}}
 async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/logout",null,"POST",null);
 a(x||{loggedIn:!1}),hqDropStatus(),v("已退出账号同步。"),T("")}finally{m(!1)}}
 async function RS(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/restore",null,"POST",null);
@@ -204,7 +259,7 @@ JSX.jsxs("div",{className:"hq-acct-actions",children:[
 JSX.jsx("button",{className:"secondary",onClick:()=>void L(),
 disabled:g||o.length!==11||hqCd>0,children:hqCd>0?("重新发送（"+hqCd+"s）"):"发送验证码"}),
 JSX.jsx("button",{className:"primary",onClick:()=>void R(),disabled:g||o.length!==11||d.length<4,
-children:g?"处理中…":"登录"})]})]}),
+children:g?"处理中…":(hqTryAt>0?("请稍候（"+hqTryAt+"s）"):"登录")})]})]}),
 p?JSX.jsx("p",{className:"hq-acct-note"+(E?" error":""),role:"status",children:p}):null]})}
 """
 
@@ -339,5 +394,13 @@ def patch(text):
         r'window.__hqLib={fav:\g<2>,hist:\g<4>,setFav:\g<1>,setHist:\g<3>},'
         r'hqMergeLibrary(\g<2>,\g<4>,\g<1>,\g<3>),!0)}catch(',
         "手机端历史/收藏合并")
+
+    # 9) 切到「历史」页时自动刷新
+    # 上游侧栏的历史入口是 onClick:()=>o("history")，变量名会变，所以用探针。
+    s = _sub_once(
+        s,
+        r'onClick:\(\)=>([\w$]+)\("history"\)',
+        r'onClick:()=>{\g<1>("history");void hqRefreshLibrary()}',
+        "历史页自动刷新")
 
     return s, log
