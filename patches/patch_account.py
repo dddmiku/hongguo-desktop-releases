@@ -37,19 +37,51 @@ function hqSyncFavorite(seriesId,favorite){
 if(!/^\d{8,24}$/.test(String(seriesId||"")))return Promise.resolve(null);
 return hqAcctCall("/desktop/account/favorite",{series_id:String(seriesId),
 favorite:favorite?"true":"false"},"POST",null)}
+function hqForgetApi(){try{localStorage.removeItem("guoban:api")}catch(e){}}
+var hqNeedPlayHint="请先播放任意一集，再回到这里登录（本机服务凭据只在播放时下发）。";
+// 本机服务地址每次启动都会变，所以端口以 get_validation_status 的实时值为准；
+// 密钥由后端在播放链接里下发，播放一次即可拿到。
+async function hqApiAlive(){const v=hqApi();if(!v)return!1;
+try{const r=await fetch(v.origin+"/desktop/account/status",
+{method:"GET",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error",
+signal:AbortSignal.timeout(4000)});return r.ok}catch(e){return!1}}
 '''
 
 PANEL = r"""
 function hqAccountPanel(){const[n,a]=REACT.useState(null),[o,c]=REACT.useState(""),
 [d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState(""),
 [hqCd,hqSetCd]=REACT.useState(0);
-REACT.useEffect(()=>{let x=!0;hqAcctCall("/desktop/account/status",null,"GET",null).then(A=>{x&&A&&a(A)});return()=>{x=!1}},[]);
+REACT.useEffect(()=>{let x=!0,stop=!1;
+async function load(){
+const alive=await hqApiAlive();
+if(!alive){hqForgetApi();if(x){a({loggedIn:!1});v(hqNeedPlayHint),T("")}return!1}
+const A=await hqAcctCall("/desktop/account/status",null,"GET",null);
+if(x&&A){a(A);v(""),T("")}return!0}
+(async()=>{
+if(await load())return;
+// 凭据只在播放时下发。这里自动等：窗口重新获得焦点或每 3 秒重试一次，
+// 用户去播一集再回来就会自动接上，不用手动刷新。
+const tick=async()=>{if(stop||!x)return;if(await load()){stop=!0;return}
+window.setTimeout(tick,3000)};
+const onFocus=()=>{stop||void load()};
+window.addEventListener("focus",onFocus);
+window.addEventListener("visibilitychange",onFocus);
+window.setTimeout(tick,3000);
+return()=>{stop=!0;window.removeEventListener("focus",onFocus);
+window.removeEventListener("visibilitychange",onFocus)}})();
+return()=>{x=!1;stop=!0}},[]);
 REACT.useEffect(()=>{if(hqCd<=0)return;const x=window.setTimeout(()=>hqSetCd(A=>A-1),1000);return()=>window.clearTimeout(x)},[hqCd]);
 function hqErr(e){return e&&e.message?String(e.message).slice(0,200):"请求失败"}
-async function hqPost(path,q){const v=hqApi();if(!v)throw new Error("请先播放任意一集（本机服务地址会随后记录），再回到这里登录。");
+async function hqPost(path,q){const v=hqApi();if(!v)throw new Error(hqNeedPlayHint);
 const u=new URL(v.origin+path);Object.entries(q).forEach(([k,x])=>u.searchParams.set(k,x));
-const r=await fetch(u.toString(),{method:"POST",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error"});
-if(!r.ok){let d="";try{d=(await r.json()).detail||""}catch(x){}throw new Error(d||("HTTP "+r.status))}
+let r;try{
+r=await fetch(u.toString(),{method:"POST",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error"})
+}catch(e){
+// 连不上 = 应用重启后端口/密钥已换。清掉失效凭据，让提示可操作。
+hqForgetApi();throw new Error(hqNeedPlayHint)}
+if(!r.ok){let d="";try{d=(await r.json()).detail||""}catch(x){}
+if(r.status===401||r.status===403)hqForgetApi();
+throw new Error(d||("HTTP "+r.status))}
 return r.json().catch(()=>null)}
 async function L(){m(!0),v("");try{const x=await hqPost("/desktop/account/send_code",{mobile:o});
 hqSetCd(Number(x&&x.retryTime)>0?Number(x.retryTime):60);
@@ -186,12 +218,14 @@ def patch(text):
         'b.jsx(hqAccountPanel,{})]}):',
         "账号页面板")
 
-    # 6) 侧栏「账号」入口：本机服务可用时也显示
+    # 6) 侧栏「账号」入口：始终可见。
+    # 之前依赖「已配置 or 有本机凭据」，而凭据会被清掉（应用重启后失效），
+    # 于是入口整个消失、用户连面板都进不去。这里改为常驻。
     s = _sub_once(
         s,
         re.escape('Ti?.configured&&b.jsx(Na,{active:a==="account"'),
-        '(Ti?.configured||!!hqApi())&&b.jsx(Na,{active:a==="account"',
-        "侧栏账号入口")
+        '(true)&&b.jsx(Na,{active:a==="account"',
+        "侧栏账号入口常驻")
 
     # 7) 面板组件本体（放在账号面板组件之前）
     m = re.search(r'function aM\(\{status:r,qrLogin:e,busy:t,message:i,onRefresh:n,onStartLogin:a,onLogout:o\}\)\{',
