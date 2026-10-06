@@ -87,6 +87,19 @@ JR_CALL_NEW = (
 JR_HIDE_OLD = "function G(){clearTimeout(V.current),"
 JR_HIDE_NEW = "function G(){hqAutoAdvance&&(hqAutoAdvance.current=!1),clearTimeout(V.current),"
 
+# 自动连播时，旧集的 pause/ended 也会把控制栏变可见（第二条路径）。
+# 实测时序：ended -> 此处 z(!0) 弹出 -> emptied 后新集首次 playing 再次 z(!0)。
+# 两条路径都要挡。
+JR_PAUSE_OLD = (
+    '(Le?.type==="pause"||Le?.type==="ended")&&!k.current.disabled&&'
+    '!(ye.ended&&k.current.autoContinue)&&z(!0)'
+)
+JR_PAUSE_NEW = (
+    '(Le?.type==="pause"||Le?.type==="ended")&&!k.current.disabled&&'
+    '!(ye.ended&&k.current.autoContinue)&&'
+    '!(hqAutoAdvance&&hqAutoAdvance.current)&&z(!0)'
+)
+
 # 自动连播后的首次 playing 不把控制栏变可见
 JR_PLAYING_OLD = "q(\"\"),$(\"播放中\"),z(!0),W(!1),Ft&&vt.current?.media!==De&&or(De)"
 JR_PLAYING_NEW = (
@@ -262,6 +275,7 @@ def patch(text):
     p.sub(re.escape(AUTOARM_OLD), AUTOARM_NEW, "自动连播置位标志")
     p.sub(re.escape(JR_PROPS_OLD), JR_PROPS_NEW, "播放器组件接收标志引用")
     p.sub(re.escape(JR_CALL_OLD), JR_CALL_NEW, "播放器组件传参")
+    p.sub(re.escape(JR_PAUSE_OLD), JR_PAUSE_NEW, "自动连播时 pause/ended 不弹控制栏")
     p.sub(re.escape(JR_HIDE_OLD), JR_HIDE_NEW, "隐藏周期清掉标志")
     p.sub(re.escape(JR_PLAYING_OLD), JR_PLAYING_NEW, "首次 playing 不弹控制栏")
 
