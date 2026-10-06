@@ -41,15 +41,18 @@ favorite:favorite?"true":"false"},"POST",null)}
 
 PANEL = r"""
 function hqAccountPanel(){const[n,a]=REACT.useState(null),[o,c]=REACT.useState(""),
-[d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState("");
+[d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState(""),
+[hqCd,hqSetCd]=REACT.useState(0);
 REACT.useEffect(()=>{let x=!0;hqAcctCall("/desktop/account/status",null,"GET",null).then(A=>{x&&A&&a(A)});return()=>{x=!1}},[]);
+REACT.useEffect(()=>{if(hqCd<=0)return;const x=window.setTimeout(()=>hqSetCd(A=>A-1),1000);return()=>window.clearTimeout(x)},[hqCd]);
 function hqErr(e){return e&&e.message?String(e.message).slice(0,200):"请求失败"}
 async function hqPost(path,q){const v=hqApi();if(!v)throw new Error("请先播放任意一集（本机服务地址会随后记录），再回到这里登录。");
 const u=new URL(v.origin+path);Object.entries(q).forEach(([k,x])=>u.searchParams.set(k,x));
 const r=await fetch(u.toString(),{method:"POST",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error"});
 if(!r.ok){let d="";try{d=(await r.json()).detail||""}catch(x){}throw new Error(d||("HTTP "+r.status))}
 return r.json().catch(()=>null)}
-async function L(){m(!0),v("");try{await hqPost("/desktop/account/send_code",{mobile:o});
+async function L(){m(!0),v("");try{const x=await hqPost("/desktop/account/send_code",{mobile:o});
+hqSetCd(Number(x&&x.retryTime)>0?Number(x.retryTime):60);
 v("验证码已发送，请查看手机短信。"),T("")}catch(e){v("发送失败："+hqErr(e)),T("error")}finally{m(!1)}}
 async function R(){m(!0),v("");try{const x=await hqPost("/desktop/account/login",{mobile:o,code:d});
 if(x&&x.loggedIn){a(x),f(""),v("登录成功，观看进度与收藏会同步到手机。"),T("")}else{v("登录失败：响应异常"),T("error")}}catch(e){v("登录失败："+hqErr(e)),T("error")}finally{m(!1)}}
@@ -74,7 +77,8 @@ JSX.jsxs("label",{className:"hq-acct-row",children:[JSX.jsx("span",{children:"�
 JSX.jsx("input",{type:"tel",inputMode:"numeric",autoComplete:"off",value:d,placeholder:"短信验证码",
 onChange:x=>f(x.target.value.replace(/\D/g,"").slice(0,8))})]}),
 JSX.jsxs("div",{className:"hq-acct-actions",children:[
-JSX.jsx("button",{className:"secondary",onClick:()=>void L(),disabled:g||o.length!==11,children:"发送验证码"}),
+JSX.jsx("button",{className:"secondary",onClick:()=>void L(),
+disabled:g||o.length!==11||hqCd>0,children:hqCd>0?("重新发送（"+hqCd+"s）"):"发送验证码"}),
 JSX.jsx("button",{className:"primary",onClick:()=>void R(),disabled:g||o.length!==11||d.length<4,
 children:g?"处理中…":"登录"})]})]}),
 p?JSX.jsx("p",{className:"hq-acct-note"+(E?" error":""),role:"status",children:p}):null]})}
