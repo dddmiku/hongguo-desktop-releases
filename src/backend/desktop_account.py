@@ -39,6 +39,131 @@ SESSION_PATH = os.environ.get("HONGGUO_ACCOUNT_FILE") or os.path.join(
 
 # 验证码登录接口所在的 host（与主 API host 不同）
 PASSPORT_HOST = os.environ.get("HONGGUO_PASSPORT_HOST", "security.snssdk.com")
+
+# ---- 护照请求的设备身份 ---------------------------------------------------
+# 护照接口会校验设备指纹：device_id / iid / cdid 缺失会被判为异常客户端。
+# 内容接口不校验这些（所以搜索播放一直正常），只有登录会踩到。
+DEVICE_PATH = os.environ.get("HONGGUO_DEVICE_FILE") or os.path.join(
+    _DATA_DIR, "desktop-device.json")
+
+# 机型档案：与真实红果客户端一致（护照侧对参数完整性敏感，故写全）
+PASSPORT_DEVICE_DEFAULTS = {
+    "device_brand": "HONOR", "device_type": "PGT-AN10",
+    "resolution": "1080*1920", "dpi": "480",
+    "os": "android", "os_version": "12", "os_api": "32",
+    "rom_version": "V417IR release-keys", "host_abi": "arm64-v8a",
+    "channel": "vivo_8662_64", "ac": "wifi", "ssmix": "a",
+    "language": "zh", "dragon_device_type": "phone",
+    "manifest_version_code": "73932", "update_version_code": "73932",
+    "version_code": "73932", "version_name": "7.3.9.32",
+    "pv_player": "73932", "compliance_status": "0",
+    "need_personal_recommend": "1", "player_so_load": "1",
+    "is_android_pad_screen": "0", "okhttp_version": "4.2.243.31-douyin",
+    "use_store_region_cookie": "1", "use_new_token_expire_rule": "true",
+    "passport-sdk-version": "5051452",
+}
+
+
+def _digits(n):
+    import random
+    return "".join(random.choice("0123456789") for _ in range(n))
+
+
+# 已注册设备身份的来源优先级：
+#   1) 显式环境变量（HONGGUO_DEVICE_ID / _IID / _CDID）
+#   2) 本机设备文件（首次从模拟器同步后固定下来）
+#   3) 模拟器（adb 读取，已注册的那台）
+# 随机生成的 device_id 会被护照边缘直接 403，所以不能凭空造。
+DEVICE_ENV = ("HONGGUO_DEVICE_ID", "HONGGUO_DEVICE_IID", "HONGGUO_DEVICE_CDID")
+
+
+def _from_env():
+    values = [os.environ.get(name) for name in DEVICE_ENV]
+    if all(values):
+        return {"device_id": values[0], "iid": values[1], "cdid": values[2]}
+    return None
+
+
+def _from_emulator():
+    """从模拟器里已注册的红果客户端读设备身份。
+
+    只读 shared_prefs 里的公开字段，不注入进程、不改动 App。
+    实测位置：
+      device_id / iid -> applog_stats.xml
+      cdid            -> com.ss.android.deviceregister.utils.Cdid.xml
+    """
+    import subprocess
+    adb = os.environ.get("ADB", r"D:\Tools\adb\adb.exe")
+    dev = os.environ.get("ADB_DEVICE", "127.0.0.1:16448")
+    prefs = "/data/data/com.phoenix.read/shared_prefs"
+
+    def read(name):
+        try:
+            out = subprocess.run([adb, "-s", dev, "shell", "cat", "%s/%s" % (prefs, name)],
+                                 capture_output=True, timeout=20)
+        except Exception:
+            return ""
+        return out.stdout.decode("utf-8", "replace")
+
+    def grab(text, field):
+        for pat in (r'name="%s"[^>]*>([^<]+)<' % re.escape(field),
+                    r'name="%s"[^>]*value="([^"]+)"' % re.escape(field)):
+            m = re.search(pat, text)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+        return ""
+
+    found = {}
+    stats = read("applog_stats.xml")
+    if stats:
+        found["device_id"] = grab(stats, "device_id")
+        found["iid"] = grab(stats, "install_id")
+    cdid = read("com.ss.android.deviceregister.utils.Cdid.xml")
+    if cdid:
+        found["cdid"] = grab(cdid, "cdid")
+    if all(found.get(k) for k in ("device_id", "iid", "cdid")):
+        return found
+    return None
+
+
+def load_device():
+    """本机设备身份：一旦确定就固定下来，避免每次登录换设备。"""
+    env = _from_env()
+    if env:
+        return env
+    try:
+        data = json.loads(io.open(DEVICE_PATH, encoding="utf-8").read())
+        if isinstance(data, dict) and data.get("device_id") and data.get("registered"):
+            return data
+    except Exception:
+        pass
+    synced = _from_emulator()
+    if synced:
+        synced["registered"] = True
+        synced["source"] = "emulator"
+        try:
+            os.makedirs(os.path.dirname(DEVICE_PATH), exist_ok=True)
+            io.open(DEVICE_PATH, "w", encoding="utf-8").write(
+                json.dumps(synced, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+        return synced
+    # 兜底：沿用已存文件（即便未标记 registered），最后才随机
+    try:
+        data = json.loads(io.open(DEVICE_PATH, encoding="utf-8").read())
+        if isinstance(data, dict) and data.get("device_id"):
+            return data
+    except Exception:
+        pass
+    import uuid
+    return {"device_id": _digits(16), "iid": _digits(16), "cdid": str(uuid.uuid4())}
+
+
+def passport_query():
+    """护照请求要带的完整设备参数（内容接口那套精简 query 不够用）。"""
+    query = dict(PASSPORT_DEVICE_DEFAULTS)
+    query.update(load_device())
+    return query
 SMS_TYPE = os.environ.get("HONGGUO_SMS_TYPE", "24")   # 抓包: type=24 → 登录场景
 
 _lock = threading.RLock()
@@ -169,9 +294,19 @@ def _headers(session=None, extra=None):
     return headers
 
 
-def _call(method, path, body=None, extra=None, session=None, host=None, form=None):
-    """发一个带签名的红果请求。body/form 二选一。"""
-    url = H.build_url(path, extra)
+def _call(method, path, body=None, extra=None, session=None, host=None, form=None,
+          passport=False):
+    """发一个带签名的红果请求。body/form 二选一。
+
+    passport=True 时用完整设备参数（登录接口校验设备指纹，精简 query 会被风控）。
+    """
+    if passport:
+        merged = dict(passport_query())
+        if extra:
+            merged.update(extra)
+        url = H.build_url(path, merged)
+    else:
+        url = H.build_url(path, extra)
     if host:
         url = re.sub(r"^https://[^/]+", "https://" + host, url)
     headers = _headers(session)
@@ -234,7 +369,7 @@ def send_code(mobile):
     form = (_passport_form(mobile=mobile) + "&type=" + xor_hex(SMS_TYPE)
             + "&unbind_exist=" + xor_hex("1") + "&auto_read=0")
     r = _call("POST", "/passport/mobile/send_code/v1/", form=form,
-              session={}, host=PASSPORT_HOST)
+              session={}, host=PASSPORT_HOST, passport=True)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}
@@ -296,7 +431,7 @@ def sms_login(mobile, code):
         return {"ok": False, "error": "验证码格式不正确"}
     form = _passport_form(mobile=mobile, code=code)
     r = _call("POST", "/passport/mobile/sms_login/", form=form,
-              session={}, host=PASSPORT_HOST)
+              session={}, host=PASSPORT_HOST, passport=True)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}
