@@ -325,7 +325,41 @@ def save_session(data):
 
 
 def clear_session():
+    """退出登录：先留一份可恢复的备份，再清空。
+
+    验证码登录尚未稳定，万一退出后登不回来，用户不该被卡死；
+    所以这里把当前登录态另存一份，restore_session() 可以原样恢复。
+    """
+    current = load_session() or {}
+    if current.get("token") or current.get("cookie"):
+        try:
+            io.open(SESSION_PATH + ".last", "w", encoding="utf-8").write(
+                json.dumps(current, ensure_ascii=False, indent=2))
+        except OSError:
+            pass
     return save_session({})
+
+
+def restore_session():
+    """把上一次「退出登录」前的登录态恢复回来。"""
+    try:
+        data = json.loads(io.open(SESSION_PATH + ".last", encoding="utf-8").read())
+    except Exception:
+        return {"ok": False, "error": "没有可恢复的登录态"}
+    if not (isinstance(data, dict) and (data.get("token") or data.get("cookie"))):
+        return {"ok": False, "error": "备份里没有有效登录态"}
+    save_session(data)
+    log_event("restore_session", ok=True)
+    return {"ok": True, "session": public_session(data)}
+
+
+def has_restorable():
+    """是否存在可恢复的登录态（用于前端显示恢复入口）。"""
+    try:
+        data = json.loads(io.open(SESSION_PATH + ".last", encoding="utf-8").read())
+        return bool(isinstance(data, dict) and (data.get("token") or data.get("cookie")))
+    except Exception:
+        return False
 
 
 def is_logged_in():
@@ -380,8 +414,11 @@ def _call(method, path, body=None, extra=None, session=None, host=None, form=Non
         #   3) 请求体必须带 x-ss-stub（登录/发码都是表单，所以是真机那种 32 位大写十六进制）
         # 只补 1+2 仍然失败；补上 3 后服务端才放行（错误码从 7 变成「验证码错误/过期」）。
         #
-        # 头部要与模拟器逐项对齐：补 lc / x-vc-bdturing-sdk-version，
-        # 并去掉内容接口那套 x-tt-store-region / x-tt-store-region-src（护照请求不带）。
+        # 头部要与真机逐项对齐（2026-10-07 对照实验，真机头部全量通过风控）：
+        #   · 去掉内容接口那套 x-tt-store-region*，以及 X-Neptune / X-Soter（护照请求不带）
+        #   · 补 lc / x-vc-bdturing-sdk-version
+        #   · cookie 与 x-tt-passport-csrf-token 必须带上（真机请求里有；
+        #     之前 sms_login 传了空 session，等于完全不发 cookie，这是被拦的关键）
         for stale in ("x-tt-store-region", "x-tt-store-region-src"):
             headers.pop(stale, None)
         headers["user-agent"] = PASSPORT_UA
@@ -390,8 +427,21 @@ def _call(method, path, body=None, extra=None, session=None, host=None, form=Non
         headers["x-ss-req-ticket"] = str(int(time.time() * 1000))
         if data is not None:
             headers["x-ss-stub"] = hashlib.md5(data).hexdigest().upper()
+        # csrf：优先用会话里的；没有就从 cookie 里抠出来。
+        csrf = ""
+        cookie_text = headers.get("cookie") or ""
+        m = re.search(r"passport_csrf_token=([^;]+)", cookie_text)
+        if m:
+            csrf = m.group(1)
+        if csrf:
+            headers["x-tt-passport-csrf-token"] = csrf
     headers.update(H.sign(url, headers))
     headers.pop("accept-encoding", None)
+    if passport:
+        # 签名会补上 X-Neptune / X-Soter，但真机的护照请求没有这两个头，
+        # 必须在签名之后删，否则等于没删。
+        for stale in ("x-neptune", "x-soter", "X-Neptune", "X-Soter"):
+            headers.pop(stale, None)
     r = H.http_request(method, url, data=data, headers=headers, timeout=30)
     return r
 
@@ -455,7 +505,7 @@ def send_code(mobile):
             + "&type=" + xor_hex(SMS_TYPE)
             + "&unbind_exist=" + xor_hex("1") + "&auto_read=0")
     r = _call("POST", "/passport/mobile/send_code/v1/", form=form,
-              session={}, host=PASSPORT_HOST, passport=True)
+              host=PASSPORT_HOST, passport=True)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}
@@ -517,7 +567,7 @@ def sms_login(mobile, code):
         return {"ok": False, "error": "验证码格式不正确"}
     form = _passport_form(mobile=normalize_mobile(mobile), code=code, with_device=True)
     r = _call("POST", "/passport/mobile/sms_login/", form=form,
-              session={}, host=PASSPORT_HOST, passport=True)
+              host=PASSPORT_HOST, passport=True)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}

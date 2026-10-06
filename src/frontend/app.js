@@ -343,6 +343,38 @@ if(!/^\d{8,24}$/.test(String(seriesId||"")))return Promise.resolve(null);
 return hqAcctCall("/desktop/account/favorite",{series_id:String(seriesId),
 favorite:favorite?"true":"false"},"POST",null)}
 function hqForgetApi(){try{localStorage.removeItem("guoban:api")}catch(e){}}
+
+// 主动取本机链路密钥，不用先播一集。
+// 上游只在播放时把带 api_key 的播放地址交给前端，导致「要看过视频才能登录」。
+// 实际上拿任意一部已缓存剧集问 get_validation_playback 就能得到同样的地址，
+// 里面就带着密钥 —— 所以这里自己问一次，避免这个离谱的前置条件。
+async function hqEnsureApi(){
+if(hqApi())return hqApi();
+try{
+const T=window.__TAURI_INTERNALS__;if(!T||!T.invoke)return null;
+// 候选剧集号：先问本机片单，再退回内置的公开剧号。
+let ids=[];
+try{const h=await T.invoke("list_history");if(Array.isArray(h))ids=ids.concat(h.map(function(x){return String(x.seriesId)}))}catch(e){}
+try{const f=await T.invoke("list_favorites");if(Array.isArray(f))ids=ids.concat(f.map(function(x){return String(x.seriesId)}))}catch(e){}
+ids=ids.concat(["7687963052590763070","7693487608646618174","7691717179049249854"]);
+for(const id of ids){
+if(!/^\d{8,24}$/.test(String(id||"")))continue;
+try{
+const p=await T.invoke("get_validation_playback",{seriesId:String(id),episode:1});
+const u=p&&p.streamUrl;if(!u)continue;
+const v=hqApiInfo(u);if(v){hqRememberApi(u);return v}
+}catch(e){}}
+}catch(e){}
+return null}
+
+// 登录态展示缓存。
+// 本机链路密钥每次启动都会换（端口也换），要播一集才能拿到新的；
+// 在那之前先把「上次确认过的登录状态」显示出来，避免重开就显示未登录。
+function hqSaveStatus(s){try{if(s&&s.loggedIn)localStorage.setItem("guoban:acct",
+JSON.stringify({userName:s.userName||"",uid:s.uid||"",at:Date.now()}))}catch(e){}}
+function hqDropStatus(){try{localStorage.removeItem("guoban:acct")}catch(e){}}
+function hqCachedStatus(){try{const v=JSON.parse(localStorage.getItem("guoban:acct")||"null");
+return v&&v.userName?{loggedIn:!0,userName:v.userName,uid:v.uid||"",cached:!0}:{loggedIn:!1}}catch(e){return{loggedIn:!1}}}
 var hqNeedPlayHint="请先播放任意一集，再回到这里登录（本机服务凭据只在播放时下发）。";
 // 本机服务地址每次启动都会变，所以端口以 get_validation_status 的实时值为准；
 // 密钥由后端在播放链接里下发，播放一次即可拿到。
@@ -354,6 +386,12 @@ signal:AbortSignal.timeout(4000)});return r.ok}catch(e){return!1}}
 // 手机端历史/收藏：拉回来后并入本机片单。
 // 上游的「观看历史」页只读本机 localStorage，手机端记录一直没被读取，
 // 所以这里主动拉 /desktop/account/remote 并合并（按 seriesId 去重）。
+//
+// 两个必须注意的点（2026-10-07 实测）：
+//   1) 手机端历史有几百条，一次性塞进去会把界面压垮 —— 所以要分批追加。
+//   2) 服务端返回的顺序不一定是最新的在前 —— 必须自己按 updatedAt 排，
+//      否则截断后留下的反而是旧记录。
+var HQ_PHONE_MAX=120, HQ_PHONE_STEP=40;
 function hqRemoteLibrary(){
 return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)}
 async function hqMergeLibrary(localFav,localHist,setFav,setHist){
@@ -363,16 +401,26 @@ if(r.favoritesOk&&Array.isArray(r.favorites)&&r.favorites.length){
 const seen=new Set((localFav||[]).map(function(x){return String(x.seriesId)}));
 const merged=(localFav||[]).slice();
 r.favorites.forEach(function(f){const id=String(f.seriesId||"");
-if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:"",cover:"",fromPhone:!0})}});
+if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:"",
+cover:"",tags:[],actors:[],intro:"",episodeCount:0,hotText:"",fromPhone:!0})}});
 if(merged.length!==(localFav||[]).length)setFav(merged)}
 if(r.historyOk&&Array.isArray(r.history)&&r.history.length){
 const seen=new Set((localHist||[]).map(function(x){return String(x.seriesId)}));
-const merged=(localHist||[]).slice();
-r.history.forEach(function(h){const id=String(h.seriesId||"");
-if(id&&!seen.has(id)){seen.add(id);merged.push({seriesId:id,title:h.title||"",
-cover:h.cover||"",lastEpisode:Number(h.episode)||1,
-episodeCount:Number(h.total)||0,fromPhone:!0})}});
-if(merged.length!==(localHist||[]).length)setHist(merged)}
+const extra=r.history.filter(function(h){return h&&h.seriesId&&!seen.has(String(h.seriesId))})
+.slice().sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0)})
+.slice(0,HQ_PHONE_MAX)
+.map(function(h){return {seriesId:String(h.seriesId),title:h.title||"",cover:h.cover||"",
+tags:[],actors:[],intro:"",hotText:"",
+lastEpisode:Number(h.episode)||1,episodeCount:Number(h.total)||0,fromPhone:!0}});
+if(!extra.length)return;
+// 分批追加：每批 HQ_PHONE_STEP 条，让界面能喘口气。
+for(let i=0;i<extra.length;i+=HQ_PHONE_STEP){
+const part=extra.slice(i,i+HQ_PHONE_STEP);
+setHist(function(prev){
+const have=new Set((prev||[]).map(function(x){return String(x.seriesId)}));
+const add=part.filter(function(x){return !have.has(String(x.seriesId))});
+return add.length?(prev||[]).concat(add):prev})}
+}
 }catch(e){}}
 
 // 账号页确认「本机 API 已连通」后，补一次合并。
@@ -389,10 +437,11 @@ function hqAccountPanel(){const[n,a]=P.useState(null),[o,c]=P.useState(""),
 [hqCd,hqSetCd]=P.useState(0);
 P.useEffect(()=>{let x=!0,stop=!1;
 async function load(){
+if(!hqApi())await hqEnsureApi();
 const alive=await hqApiAlive();
-if(!alive){hqForgetApi();if(x){a({loggedIn:!1});v(hqNeedPlayHint),T("")}return!1}
+if(!alive){hqForgetApi();if(x){a(hqCachedStatus());v(hqNeedPlayHint),T("")}return!1}
 const A=await hqAcctCall("/desktop/account/status",null,"GET",null);
-if(x&&A){a(A);v(""),T("");hqMergeOnce()}return!0}
+if(x&&A){a(A);hqSaveStatus(A);v(""),T("");hqMergeOnce()}return!0}
 (async()=>{
 if(await load())return;
 // 凭据只在播放时下发。这里自动等：窗口重新获得焦点或每 3 秒重试一次，
@@ -423,14 +472,18 @@ async function L(){m(!0),v("");try{const x=await hqPost("/desktop/account/send_c
 hqSetCd(Number(x&&x.retryTime)>0?Number(x.retryTime):60);
 v("验证码已发送，请查看手机短信。"),T("")}catch(e){v("发送失败："+hqErr(e)),T("error")}finally{m(!1)}}
 async function R(){m(!0),v("");try{const x=await hqPost("/desktop/account/login",{mobile:o,code:d});
-if(x&&x.loggedIn){a(x),f(""),v("登录成功，观看进度与收藏会同步到手机。"),T("")}else{v("登录失败：响应异常"),T("error")}}catch(e){v("登录失败："+hqErr(e)),T("error")}finally{m(!1)}}
+if(x&&x.loggedIn){a(x),hqSaveStatus(x),f(""),v("登录成功，观看进度与收藏会同步到手机。"),T("")}else{v("登录失败：响应异常"),T("error")}}catch(e){v("登录失败："+hqErr(e)),T("error")}finally{m(!1)}}
 async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/logout",null,"POST",null);
-a(x||{loggedIn:!1}),v("已退出账号同步。"),T("")}finally{m(!1)}}
+a(x||{loggedIn:!1}),hqDropStatus(),v("已退出账号同步。"),T("")}finally{m(!1)}}
+async function RS(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/restore",null,"POST",null);
+if(x&&x.loggedIn){a(x),hqSaveStatus(x),v("已恢复上次登录。"),T("")}else{v("恢复失败：没有可用的登录态"),T("error")}}catch(e){v("恢复失败："+hqErr(e)),T("error")}finally{m(!1)}}
 const A=!!(n&&n.loggedIn);
 return b.jsxs("section",{className:"content account-page",children:[
 b.jsxs("div",{className:"headline-row",children:[b.jsxs("div",{children:[
 b.jsx("span",{className:"eyebrow",children:"红果账号同步"}),b.jsx("h1",{children:"验证码登录"})]}),
-A?b.jsx("button",{className:"secondary",onClick:()=>void D(),disabled:g,children:"退出登录"}):null]}),
+A?b.jsx("button",{className:"secondary",onClick:()=>void D(),disabled:g,children:"退出登录"}):
+(n&&n.restorable?b.jsx("button",{className:"secondary",onClick:()=>void RS(),disabled:g,
+children:g?"处理中…":"恢复上次登录"}):null)]}),
 b.jsxs("div",{className:"account-status-card "+(A?"online":""),role:"status",children:[
 b.jsxs("div",{children:[b.jsx("strong",{children:A?("已登录 · "+(n.userName||"红果账号")):"未登录"}),
 b.jsx("p",{children:A?"桌面端看完的集数与收藏会同步到手机红果的历史/收藏里。"

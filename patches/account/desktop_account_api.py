@@ -20,7 +20,17 @@ def register(app):
 
     @app.get("/desktop/account/status")
     def desktop_account_status():
-        return A.public_session()
+        result = A.public_session()
+        result["restorable"] = A.has_restorable()
+        return result
+
+    @app.post("/desktop/account/restore")
+    def desktop_account_restore():
+        """恢复上一次退出登录前的登录态。"""
+        result = A.restore_session()
+        if not result.get("ok"):
+            raise HTTPException(400, str(result.get("error") or "恢复失败"))
+        return result["session"]
 
     @app.post("/desktop/account/send_code")
     def desktop_account_send_code(mobile: str = Query(..., min_length=11, max_length=11)):
