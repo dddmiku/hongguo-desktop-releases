@@ -10,7 +10,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tauri_assets import Assets
+from tauri_assets import Assets, load_capacities, save_capacities
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -56,7 +56,7 @@ def main():
     src_exe, out_exe = sys.argv[1], sys.argv[2]
     fe = sys.argv[3] if len(sys.argv) > 3 else os.path.join(ROOT, "src", "frontend")
 
-    a = Assets(src_exe)
+    a = Assets(src_exe, load_capacities(src_exe))
     found = a.find()
     if not found:
         raise SystemExit("[FAIL] 未在 exe 内找到前端资源")
@@ -76,6 +76,7 @@ def main():
               f"(余量 {old_len - new_len}) q={enc['quality']} w={enc['lgwin']}")
 
     a.save(out_exe)
+    save_capacities(out_exe, a.capacities)
     print("[OK] wrote", out_exe)
 
 

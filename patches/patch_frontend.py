@@ -418,7 +418,15 @@ def main():
     dst = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "src", "frontend", "app.js")
     s = io.open(src, encoding="utf-8").read()
     p = patch(s)
-    io.open(dst, "w", encoding="utf-8", newline="").write(p.s)
+    text = p.s
+    # ---- 账号同步（验证码登录 / 进度 / 收藏）----
+    try:
+        import patch_account
+        text, acc_log = patch_account.patch(text)
+        p.log.extend(acc_log)
+    except ImportError:
+        pass
+    io.open(dst, "w", encoding="utf-8", newline="").write(text)
     # app.css / index.html 不需要改内容，但要跟随基线一起同步（上游发版会变）。
     src_dir = os.path.dirname(src)
     dst_dir = os.path.dirname(dst)

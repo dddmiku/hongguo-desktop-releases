@@ -12,6 +12,7 @@ __pycache__/
 # 构建输出
 dist/*.exe
 dist/repack-report.json
+dist/*.blobcaps.json
 
 # 逆向/调试期间的一次性脚本（未纳入维护）
 tools/balance.js

@@ -43,7 +43,8 @@ BACKUP = os.path.join(ROOT, "_backup")
 TASK = "HongguoDesktopPatch"
 
 # 补丁涉及的全部后端文件；部署与备份都必须覆盖它们，缺一个就会「媒体准备失败」。
-PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py")
+PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
+                 "desktop_account.py", "desktop_account_api.py")
 
 
 def sha(path):
@@ -121,6 +122,8 @@ def patch_live_backend(backend):
         "desktop_hls_service.py": ("normalize_desktop_quality",),
         "server.py": ("encode_h264(decrypted",),
         "desktop_encode.py": ("cancelled is not None and cancelled()",),
+        "desktop_account.py": ("def sms_login",),
+        "desktop_account_api.py": ("def register",),
     }
 
     patched, skipped, failed = [], [], []

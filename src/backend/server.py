@@ -648,3 +648,11 @@ def desktop_cleanup(series_id: str, ep: int):
     if not re.fullmatch(r"[0-9]{8,24}", str(series_id)) or not 1 <= ep <= 100000:
         raise HTTPException(400, "Invalid episode identity")
     return {"removed": _hq_cleanup_episode(series_id, ep)}
+
+
+# ---- 本地维护: 红果账号同步（验证码登录 / 观看进度 / 收藏）----
+try:
+    import desktop_account_api as _hq_account_api
+    _hq_account_api.register(app)
+except Exception as _hq_account_error:  # 账号同步不可用时不影响播放
+    print("[server] 账号同步未启用:", type(_hq_account_error).__name__)

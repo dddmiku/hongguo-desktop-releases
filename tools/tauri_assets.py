@@ -5,16 +5,38 @@ Tauri 2 把前端资源以 Brotli 流放在 .rdata，资源表每项 32 字节:
     u64 key_ptr, u64 key_len, u64 blob_ptr, u64 blob_len
 其中 *_ptr 是「镜像基址 + RVA」形式的绝对地址。
 """
-import io, os, re, struct, hashlib, brotli
+import io, os, re, struct, hashlib, json, brotli
 
 IMAGE_MAGIC_PE32P = 0x20b
 
 
+def capacity_path(exe):
+    """容量旁挂文件：记录每个资源在原始安装包里的 blob_len。"""
+    return exe + ".blobcaps.json"
+
+
+def load_capacities(exe):
+    try:
+        return json.load(io.open(capacity_path(exe), encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_capacities(exe, caps):
+    try:
+        io.open(capacity_path(exe), "w", encoding="utf-8").write(
+            json.dumps(caps, indent=2, ensure_ascii=False))
+    except OSError:
+        pass
+
+
 class Assets:
-    def __init__(self, path):
+    def __init__(self, path, capacities=None):
         self.path = path
         self.data = bytearray(io.open(path, "rb").read())
         self.image_base, self.secs = self._sections()
+        # 容量只增不减：既取旁挂文件里的历史最大值，也取本次读到的 blob_len。
+        self.capacities = dict(capacities or {})
 
     def _sections(self):
         d = self.data
@@ -77,8 +99,11 @@ class Assets:
                         raw = brotli.decompress(bytes(d[bfo:bfo + blen]))
                     except Exception:
                         continue
+                    cap = max(int(self.capacities.get(key, 0) or 0), blen)
+                    self.capacities[key] = cap
                     out[key] = {"key_fo": key_fo, "key_len": len(key), "entry_fo": entry_fo,
-                                "blob_fo": bfo, "blob_len": blen, "raw": raw}
+                                "blob_fo": bfo, "blob_len": cap, "raw": raw,
+                                "declared_len": blen}
                     break
         return out
 
@@ -92,16 +117,18 @@ class Assets:
                     if best is None or len(c) < len(best[0]):
                         best = (c, q, w, mode)
         comp, q, w, mode = best
-        if len(comp) > entry["blob_len"]:
-            raise SystemExit(f"[FAIL] 压缩后 {len(comp)} > 原容量 {entry['blob_len']}（需扩容，当前不支持）")
+        cap = int(self.capacities.get(entry.get("key") or "", 0) or 0) or entry["blob_len"]
+        if len(comp) > cap:
+            raise SystemExit(f"[FAIL] 压缩后 {len(comp)} > 容量 {cap}（需扩容，当前不支持）")
         assert brotli.decompress(comp) == raw
         fo = entry["blob_fo"]
         self.data[fo:fo + len(comp)] = comp
         struct.pack_into("<Q", self.data, entry["entry_fo"] + 24, len(comp))
-        return entry["blob_len"], len(comp), {"quality": q, "lgwin": w, "mode": mode}
+        return cap, len(comp), {"quality": q, "lgwin": w, "mode": mode}
 
     def save(self, path):
         io.open(path, "wb").write(bytes(self.data))
+        save_capacities(path, self.capacities)
 
 
 if __name__ == "__main__":

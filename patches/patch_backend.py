@@ -422,6 +422,50 @@ def patch_encode(src_dir, out_dir):
     print("OK   desktop_encode.py  (取消透传)")
 
 
+
+# ---- 本地维护: 红果账号同步（验证码登录 / 观看进度 / 收藏） ----
+ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py")
+
+ACCOUNT_REGISTER = """
+
+
+# ---- 本地维护: 红果账号同步（验证码登录 / 观看进度 / 收藏）----
+try:
+    import desktop_account_api as _hq_account_api
+    _hq_account_api.register(app)
+except Exception as _hq_account_error:  # 账号同步不可用时不影响播放
+    print("[server] 账号同步未启用:", type(_hq_account_error).__name__)
+"""
+
+
+def patch_account_backend(src_dir, out_dir):
+    """拷贝账号同步模块，并在 server.py 末尾注册路由。
+
+    模块本体存放在 patches/account/（我们的新增文件，不属于上游基线），
+    这样上游换版本时不会因为 base/ 里没有它们而漏掉。
+    """
+    account_src = os.path.join(ROOT, "patches", "account")
+    for name in ACCOUNT_FILES:
+        src = os.path.join(account_src, name)
+        if not os.path.isfile(src):
+            src = os.path.join(src_dir, name)
+        if not os.path.isfile(src):
+            continue
+        io.open(os.path.join(out_dir, name), "w", encoding="utf-8", newline="").write(
+            io.open(src, encoding="utf-8").read())
+        print("OK   %s  (账号同步)" % name)
+    p_in = os.path.join(src_dir, "server.py")
+    p_out = os.path.join(out_dir, "server.py")
+    if not os.path.isfile(p_out):
+        return
+    s = io.open(p_out, encoding="utf-8").read()
+    if "desktop_account_api" in s:
+        print("OK   server.py 账号路由已注册（跳过）")
+        return
+    io.open(p_out, "w", encoding="utf-8", newline="").write(s.rstrip("\n") + ACCOUNT_REGISTER)
+    print("OK   server.py  (注册账号同步路由)")
+
+
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "_v109", "extracted", "backend")
     dst = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "src", "backend")
@@ -434,6 +478,7 @@ def main():
     patch_service(src, dst)
     patch_server(src, dst)
     patch_encode(src, dst)
+    patch_account_backend(src, dst)
 
 
 if __name__ == "__main__":
