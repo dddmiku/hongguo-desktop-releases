@@ -109,6 +109,71 @@ JR_PLAYING_NEW = (
 )
 
 
+# ---- 本地维护: 预取提前到 2 集 ----
+# 上游只提前 1 集。一集在 3 倍速下只播 ~20s，
+# 而一集转码约 27s（解密+下载+HEVC->H.264），所以预取经常来不及，
+# 切集时只能现场等（实测 8.37s / 11.84s 黑屏）。
+# 改成用 Map 同时预取 下一集 + 下两集，把预取窗口拉长到 ~40s。
+PREFETCH_REF_OLD = "et=P.useRef(null),Ot=P.useRef(void 0),"
+PREFETCH_REF_NEW = "et=P.useRef(new Map),Ot=P.useRef(void 0),"
+
+# 预取主体：一次预取两集，结果存进 Map
+PREFETCH_BODY_OLD = (
+    "let De=!0,Fe=!1,tt;"
+)
+PREFETCH_BODY_NEW = (
+    "let De=!0,Fe=!1;"
+)
+
+PREFETCH_LOOP_OLD = (
+    'const Ut=ye.current;try{const Vt=await zs(C.seriesId,C.episode+1);'
+    'if(!De||D.current||Ut!==ye.current||Vt.source!==C.source||Vt.streamFormat!=="hls"||'
+    'Vt.seriesId!==C.seriesId||Vt.episode!==C.episode+1||!Number.isSafeInteger(Vt.total)||'
+    'Vt.total<Vt.episode)return;tt=Kw(hqWithQual(Vt.streamUrl,hqQ)),'
+    'et.current={session:Vt,preparation:tt}}catch{}}'
+)
+PREFETCH_LOOP_NEW = (
+    'const Ut=ye.current;'
+    'for(const hs of [1,2]){'
+    'const Vt=C.episode+hs;'
+    'if(Vt>Pt)break;'
+    'if(et.current.has(Vt))continue;'
+    'try{'
+    'const Ae=await zs(C.seriesId,Vt);'
+    'if(!De||D.current||Ut!==ye.current||Ae.source!==C.source||Ae.streamFormat!=="hls"||'
+    'Ae.seriesId!==C.seriesId||Ae.episode!==Vt||!Number.isSafeInteger(Ae.total)||'
+    'Ae.total<Ae.episode){continue}'
+    'const Ye=Kw(hqWithQual(Ae.streamUrl,hqQ));'
+    'if(!De||D.current||Ut!==ye.current){Ye.dispose();continue}'
+    'et.current.set(Vt,{session:Ae,preparation:Ye})'
+    '}catch{}}'
+    '}'
+)
+
+# 清理：只清超过当前+2 的，保留下一集的预取
+PREFETCH_CLEAN_OLD = (
+    "tt&&et.current?.preparation===tt&&(et.current=null,tt.dispose())"
+)
+PREFETCH_CLEAN_NEW = (
+    "et.current.forEach((Vt,hs)=>{if(hs>C.episode+2){Vt.preparation.dispose(),et.current.delete(hs)}})"
+)
+
+# 消费点：从 Map 取对应集的预取
+PREFETCH_USE_OLD = (
+    "const Fe=et.current?.session.episode===ae?et.current:null;"
+    "Fe||et.current?.preparation.dispose(),Fe||(et.current=null),Fe&&(et.current=null),"
+)
+PREFETCH_USE_NEW = (
+    "const Fe=et.current.get(ae)??null;Fe&&et.current.delete(ae),"
+)
+
+# 换集时清空预取集合
+PREFETCH_RESET_OLD = "et.current?.preparation.dispose(),et.current=null,"
+PREFETCH_RESET_NEW = (
+    "et.current.forEach(Vt=>Vt.preparation.dispose()),et.current.clear(),"
+)
+
+
 class Fail(SystemExit):
     pass
 
@@ -278,6 +343,17 @@ def patch(text):
     p.sub(re.escape(JR_PAUSE_OLD), JR_PAUSE_NEW, "自动连播时 pause/ended 不弹控制栏")
     p.sub(re.escape(JR_HIDE_OLD), JR_HIDE_NEW, "隐藏周期清掉标志")
     p.sub(re.escape(JR_PLAYING_OLD), JR_PLAYING_NEW, "首次 playing 不弹控制栏")
+
+    # ===== 12.8) 预取提前到 2 集（消除切集黑屏）====
+    # 上游只预取下一集；一集在 3 倍速下只播 ~20s，
+    # 而转码约 27s，预取来不及就会出现 8~12s 黑屏。
+    # 改成 Map 同时预取下 1 / 下 2 集，预取窗口拉长到 ~40s。
+    p.sub(re.escape(PREFETCH_REF_OLD), PREFETCH_REF_NEW, "预取改为 Map")
+    p.sub(re.escape(PREFETCH_BODY_OLD), PREFETCH_BODY_NEW, "移除单集预取变量")
+    p.sub(re.escape(PREFETCH_LOOP_OLD), PREFETCH_LOOP_NEW, "预取下 1 / 下 2 集")
+    p.sub(re.escape(PREFETCH_CLEAN_OLD), PREFETCH_CLEAN_NEW, "预取清理保留下一集")
+    p.sub(re.escape(PREFETCH_USE_OLD), PREFETCH_USE_NEW, "从 Map 取预取")
+    p.sub(re.escape(PREFETCH_RESET_OLD), PREFETCH_RESET_NEW, "换集时清空预取")
 
     # ===== 13) 键盘白名单放行新按键 =====
     p.sub(r'!\[" ","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","f","F","m","M","n","N","t","T"\]',
