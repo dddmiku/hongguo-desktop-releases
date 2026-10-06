@@ -20,9 +20,11 @@
   python tools/smoke_test.py            # 检查 src/
   python tools/smoke_test.py --live     # 同时检查安装目录
 """
+import hashlib
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -149,12 +151,81 @@ def test_markers():
     check("search 输入校验", "Invalid search query" in s)
     check("账号路由已注册", "desktop_account_api" in s or "desktop/account" in s)
     check("看过自动清理接口", "_hq_cleanup_episode" in s)
+    # 缓存路径穿越防护：vid 来自调用方，必须落在 STREAM_CACHE 之内。
+    check("缓存路径包含校验", "_hq_cache_path" in s and "Cache path escapes" in s)
+    check("残留 .partial 清扫", "_hq_sweep_partial" in s)
+    check("封面缓存淘汰", "_hq_prune_poster_cache" in s)
+    check("免鉴权名单已收敛", '"/docs"' not in s.split("_EXEMPT")[1].split("\n")[0])
+    check("封面重定向逐跳校验", "_hq_img_fetch" in s)
+    dl = os.path.join(BACKEND, "downloader.py")
+    if os.path.isfile(dl):
+        check("downloader 无 verify=False", "verify=False" not in io.open(dl, encoding="utf-8").read())
+    req = os.path.join(BACKEND, "requirements-windows.txt")
+    if os.path.isfile(req):
+        body = [l.strip() for l in io.open(req, encoding="utf-8")
+                if l.strip() and not l.strip().startswith("#")]
+        loose = [l for l in body if "==" not in l]
+        check("依赖版本已固定", not loose, "" if not loose else "未固定: " + ", ".join(loose))
     app = os.path.join(FRONTEND, "app.js")
     if os.path.isfile(app):
         f = io.open(app, encoding="utf-8", errors="replace").read()
         check("前端 账号面板", "hqAccountPanel" in f)
         check("前端 历史自动刷新", "hqRefreshLibrary" in f)
-        check("前端 换号隔离", "hqOnAccount" in f or "guoban:acctUid" in f)
+        check("前端 换号隔离", "fromUid" in f or "guoban:acctUid" in f)
+        check("前端 进度取最新", "lastEpisode:cep" in f or "lastEpisode:cep" in f.replace(" ", ""))
+        check("前端 合并结果落盘", "hqPersistMerged" in f)
+        check("前端 关播放器回收缓存", "hqPruneCache" in f)
+
+
+def test_patch_idempotency():
+    section("4b. 补丁链幂等（防止新步骤对已部署文件不生效）")
+    # 对「已含全部步骤」的 server.py 再跑一次 patch_server，文件必须不变。
+    import importlib.util
+    import tempfile
+    spec = importlib.util.spec_from_file_location(
+        "patch_backend", os.path.join(ROOT, "patches", "patch_backend.py"))
+    if spec is None:
+        check("跳过：找不到 patch_backend.py", True)
+        return
+    pb = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(pb)
+    except Exception as e:
+        check("patch_backend 可导入", False, "%s: %s" % (type(e).__name__, e))
+        return
+    check("patch_backend 可导入", True)
+    work = tempfile.mkdtemp(prefix="hqidem-")
+    for name in ("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py"):
+        src = os.path.join(BACKEND, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(work, name))
+    before = {n: hashlib.sha256(io.open(os.path.join(work, n), "rb").read()).hexdigest()
+              for n in os.listdir(work)}
+    try:
+        pb.patch_hls(work, work)
+        pb.patch_service(work, work)
+        pb.patch_server(work, work)
+        pb.patch_encode(work, work)
+    except SystemExit as e:
+        check("补丁重跑不报错", False, str(e)[:160])
+        return
+    check("补丁重跑不报错", True)
+    after = {n: hashlib.sha256(io.open(os.path.join(work, n), "rb").read()).hexdigest()
+             for n in os.listdir(work)}
+    changed = [n for n in before if before[n] != after.get(n)]
+    check("对已打补丁的文件重跑后不变", not changed,
+          "" if not changed else "被改动: " + ", ".join(changed))
+    # auto_patch 的「全步骤就位」判据必须认为 src 是完整的
+    spec2 = importlib.util.spec_from_file_location(
+        "auto_patch", os.path.join(ROOT, "tools", "auto_patch.py"))
+    if spec2 is not None:
+        ap = importlib.util.module_from_spec(spec2)
+        try:
+            spec2.loader.exec_module(ap)
+            body = io.open(os.path.join(BACKEND, "server.py"), encoding="utf-8").read()
+            check("auto_patch 认可 src 为完整补丁版", ap._fully_patched("server.py", body))
+        except Exception as e:
+            check("auto_patch 可导入", False, "%s: %s" % (type(e).__name__, e))
 
 
 def test_routes():
@@ -199,6 +270,7 @@ def main():
     test_import_server()
     test_frontend_syntax()
     test_markers()
+    test_patch_idempotency()
     test_routes()
     test_bind_scope()
     if "--live" in sys.argv:

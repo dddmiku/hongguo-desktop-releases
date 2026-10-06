@@ -158,13 +158,56 @@ hls?series_id=7693487608646618174&ep=5&quality=1080p
 ## 验证与回滚
 
 ```powershell
+python tools/smoke_test.py           # 冒烟：语法 / import / 注入点 / 补丁链幂等（30 项）
+python tools/smoke_test.py --live    # 上面 + 安装目录一致性
 python verify/repro/pool_test.py     # 编码池：BASELINE vs MODIFIED
 python verify/repro/pool_three.py    # 三态：BASELINE / MODIFIED / ROLLBACK
 bash verify/ROLLBACK.sh --all <应用目录>   # 用内嵌基线还原后端
 ```
 
+`tools/smoke_test.py` 是 2026-10-07 一次事故的产物：当时把清扫函数放在文件末尾、
+调用放在中部，`server.py` 一导入就 `NameError`，后端直接起不来，而补丁脚本自己
+「成功」退出。现在它把这类问题变成一条自动断言。
+
+它还有一项**补丁链幂等**检查（`4b`）：对已含全部步骤的 `server.py` 再跑一遍
+补丁函数，文件必须逐字节不变，且 `auto_patch._fully_patched()` 必须认可它是完整的。
+这一项防的是「新增补丁步骤对已部署文件永久不生效」——见下。
+
 `verify/VERIFICATION.txt` 记录完整证据（命令、原始输出、哈希、未覆盖项）。
 `verify/ROLLBACK.sh` 自带 base64 内嵌基线，即使仓库被裁剪也能还原。
+
+## 补丁链必须逐步幂等（重要）
+
+补丁函数与 `tools/auto_patch.py` 都**不能**用「整文件是否已含某标记」来决定跳过。
+
+2026-10-07 加了「删除上游重复 `/img` 死代码」这一步，但安装目录的 `server.py`
+早就含 `encode_h264(decrypted` 与 `_hq_cleanup_episode`，旧判据直接 `return` ——
+死代码永久留在线上，`smoke_test --live` 一直报「不一致」，而工具还报「已打补丁」。
+
+现在的规则：
+
+| 位置 | 判据 |
+| --- | --- |
+| `patch_server` 等 | **每个步骤用各自的标记**判断是否需要执行，互不牵连 |
+| `auto_patch._fully_patched()` | **全部**步骤就位才允许跳过；产出无变化时区分「已全就位（正常跳过）」与「上游结构变了（真失败）」 |
+| `patch_live_backend` 末尾 | 单独重建上游基线里**没有**的模块（`desktop_account*.py`），逐文件循环覆盖不到它们 |
+
+另外两个坑：
+
+- `patch_backend.main()` 会把 `_v109/extracted/backend` 的 `.txt` 原样拷进 `src`，
+  所以改 `requirements-windows.txt` 这类文件**必须做成补丁步骤**，只改 `src` 会被覆盖。
+- `sub_once` 的 repl 要传 `lambda m: repl`，否则注入含 `\w` 的代码会报 `bad escape`。
+
+## 历史同步的行为约定（2026-10-07 定）
+
+| 场景 | 行为 |
+| --- | --- |
+| 多端进度 | **取更靠前的**：手机 520 / PC 500，合并后显示 520（本机条目就地抬高） |
+| 进历史页 / 切回前台 | 自动拉云端并合并，不需要手动点「历史」 |
+| 手机端条目很多 | 每轮只并进最新的一批（上限 120），已并入的会落盘，下轮自然轮到下一批 |
+| 合并结果 | 同时写进 React 状态与本机 sqlite（`hqPersistMerged`），重启不丢 |
+| 换号 | 按条目级 `fromUid` 隔离：本机原有记录保留，上一个号带来的记录丢弃 |
+| 进度上报 | 成功/失败都写 `account-log.jsonl`（`progress_ok` / `progress_failed`），便于事后排查 |
 
 ## 上游更新后如何自动重新注入
 

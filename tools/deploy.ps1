@@ -3,8 +3,11 @@ $root = "d:\Users\dddmiku\AppData\Local\红果免费短剧"
 $work = "C:\Users\dddmiku\Desktop\codex\hongguo-desktop-maintain"
 
 # 需要同步的后端文件：补丁涉及的全部文件。缺一个就会出现「媒体准备失败」。
+# downloader.py 与 requirements-windows.txt 也在补丁链里改过（TLS 校验 / 版本固定），
+# 不同步就会出现「源码与安装目录不一致」。
 $files = @("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
-           "desktop_account.py", "desktop_account_api.py")
+           "desktop_account.py", "desktop_account_api.py", "downloader.py",
+           "requirements-windows.txt")
 
 Get-Process hongguo-desktop-companion -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 4
