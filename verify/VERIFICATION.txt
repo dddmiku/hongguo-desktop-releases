@@ -253,3 +253,51 @@ F. tools/deploy.ps1 + tools/restore.ps1 + tools/auto_patch.py
     因此自启动补丁任务有干净的执行窗口。
   - 上游若改动前端结构，patch_frontend.py 的探针会失败并整体中止
     （不会产出半成品），此时需要人工适配。
+
+--------------------------------------------------------------
+八、自动连播弹出控制栏：两条路径 + 被动观察验证
+--------------------------------------------------------------
+问题: 自动播到下一集时，下方控制栏会弹出，鼠标光标一起出现。
+
+定位（静态 + 真实数据）:
+  控制栏有 2.5s 自动隐藏机制，但有两条路径会把它强制设为可见：
+    A. 新一集首次 playing        -> z(!0)
+    B. 旧一集 pause / ended      -> z(!0)（同一个事件处理链）
+  第一次只挡住 A，用户反馈「还是会弹」；被动观察器记录显示
+  ended 那一刻就走 B 弹出来了，所以窗口从 3 秒开始而非 2.5 秒。
+
+修复: patches/patch_frontend.py 新增 12.7 节，共 6 处替换
+  - bi 组件新增 hqAutoAdvance ref
+  - 自动连播处（onEnded 且 autoContinue）置位
+  - jR 组件新增 autoAdvanceRef 形参 + 调用点传参
+  - G()（正常隐藏周期开始）清除标志
+  - 路径 A（首次 playing）跳过
+  - 路径 B（pause/ended）跳过
+  用标志位而非定时窗口，避免切集耗时（下载/转码）超过窗口时失效。
+
+验证方式（按用户要求，不再驱动其播放器）:
+  安装只读观察器：仅监听 media 事件与 .player-chrome/.player-stage 的
+  class 变化，不发任何点击或按键。以下是用户自然观看时产生的数据。
+
+  修复前（22:01:35）:
+    media:pause  | 81.29/81.29
+    media:ended  | 0.00/?
+    chrome | player-chrome visible      <-- 弹出
+    media:emptied
+    chrome | player-chrome
+    chrome | player-chrome visible      <-- 再次弹出
+
+  修复后（22:05:28 / 22:05:46，连续两次自动连播）:
+    media:pause  | 67.69/67.69
+    media:ended  | 0.00/?
+    media:emptied                        <-- 无 chrome visible
+    media-init | bound
+    media:pause  | 54.29/54.29
+    media:ended  | 0.00/?
+    media:emptied                        <-- 无 chrome visible
+
+  用户确认: 「正常了」
+
+部署:
+  exe sha256 = d1dc665d22c50406444b5168…（与 dist 逐字节一致）
+  后端 4 文件与 src/backend 逐一相等
