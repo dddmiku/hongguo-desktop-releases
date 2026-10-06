@@ -41,17 +41,24 @@ function hqForgetApi(){try{localStorage.removeItem("guoban:api")}catch(e){}}
 
 // 主动取本机链路密钥，不用先播一集。
 // 上游只在播放时把带 api_key 的播放地址交给前端，导致「要看过视频才能登录」。
-// 实际上拿任意一部已缓存剧集问 get_validation_playback 就能得到同样的地址，
+// 实际上拿任意一部剧问 get_validation_playback 就能得到同样的地址，
 // 里面就带着密钥 —— 所以这里自己问一次，避免这个离谱的前置条件。
+// 剧号来源优先用应用自己的数据（本机片单 -> 榜单），不写死。
 async function hqEnsureApi(){
 if(hqApi())return hqApi();
 try{
 const T=window.__TAURI_INTERNALS__;if(!T||!T.invoke)return null;
-// 候选剧集号：先问本机片单，再退回内置的公开剧号。
 let ids=[];
 try{const h=await T.invoke("list_history");if(Array.isArray(h))ids=ids.concat(h.map(function(x){return String(x.seriesId)}))}catch(e){}
 try{const f=await T.invoke("list_favorites");if(Array.isArray(f))ids=ids.concat(f.map(function(x){return String(x.seriesId)}))}catch(e){}
-ids=ids.concat(["7687963052590763070","7693487608646618174","7691717179049249854"]);
+if(!ids.length){
+for(const cmd of (["get_rank","get_recommendations","get_new_releases"])){
+if(ids.length)break;
+try{
+const r=await T.invoke(cmd,{kind:"hot"});
+const arr=r&&(r.items||r);if(Array.isArray(arr))ids=ids.concat(arr.map(function(x){return String(x&&x.seriesId||"")}))}
+catch(e){}}
+}
 for(const id of ids){
 if(!/^\d{8,24}$/.test(String(id||"")))continue;
 try{
