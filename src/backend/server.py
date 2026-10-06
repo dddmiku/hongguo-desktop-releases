@@ -320,8 +320,11 @@ def api_search_page(q: str = Query(..., min_length=1, max_length=80), cursor: st
 @app.get("/search")
 def api_search(q: str = Query(..., description="剧名"),
               limit: int = Query(None, ge=1, le=40, description="结果上限(越小越快; 默认走 HG_SEARCH_MAX_ITEMS=20)")):
+    _q = (q or "").strip()
+    if not _q or len(_q) > 80:
+        raise HTTPException(400, "Invalid search query")
     try:
-        return {"query": q, "results": H.search(q, max_items=limit)}
+        return {"query": _q, "results": H.search(_q, max_items=limit)}
     except Exception as e:
         raise HTTPException(500, {"code": "SEARCH_FAILED", "error_type": type(e).__name__,
                                   "safe_response": getattr(e, "safe_response", None),
@@ -544,6 +547,26 @@ if os.environ.get("HONGGUO_SESSION_API_KEY") and os.environ.get("HONGGUO_HLS_WOR
                       int(os.environ.get("HONGGUO_CACHE_KEEP_FILES") or 8))
         return result
 
+    try:
+        _hq_cur = os.path.abspath(os.environ["HONGGUO_HLS_WORK_DIR"])
+        _hq_parent = os.path.dirname(_hq_cur)
+        import shutil as _hq_sh
+        for _n in os.listdir(_hq_parent):
+            if not _n.startswith("desktop-hls-"):
+                continue
+            _old = os.path.join(_hq_parent, _n)
+            if os.path.abspath(_old) == _hq_cur:
+                continue
+            if not os.path.isdir(_old) or os.path.islink(_old):
+                continue
+            if os.path.dirname(os.path.abspath(_old)) != _hq_parent:
+                continue
+            try:
+                _hq_sh.rmtree(_old)
+            except OSError:
+                pass
+    except Exception:
+        pass
     _desktop_jobs = HlsJobs(os.environ["HONGGUO_HLS_WORK_DIR"], _desktop_source)
     app.include_router(make_router(_desktop_jobs, _keys.is_valid))
     # Must wrap authentication so browser preflight can complete, but every
@@ -562,6 +585,51 @@ if __name__ == "__main__":
 
 
 # ---- 本地维护: 看过的集自动清理缓存 ----
+def _hq_sweep_stale_sessions(root=None, keep=1):
+    """清扫上次运行遗留的 HLS 工作目录。
+
+    2026-10-07 实测：应用数据目录里积了 31 个 desktop-hls-* 目录，
+    其中 6 个残留合计 1.89 GB。设计上由 Rust 父进程在退出时删除，
+    但后端被强杀/崩溃时不会执行，目录就永久留下了。
+    这里在启动时清一次：只删「工作根目录下的 UUID 子目录」，保留最新的一个。
+
+    注意：必须定义在 server.py 的模块级调用之前，
+    否则会 NameError（2026-10-07 踩过，后端直接起不来）。
+    """
+    import re as _re
+    import shutil as _sh
+    root = root or os.environ.get("HONGGUO_HLS_WORK_DIR") or ""
+    if not root or not os.path.isdir(root):
+        return 0
+    root = os.path.abspath(root)
+    try:
+        entries = []
+        for name in os.listdir(root):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            # 只认 UUID 形态的子目录，绝不碰其他内容。
+            if not _re.fullmatch(r"[0-9a-fA-F-]{8,64}", name):
+                continue
+            try:
+                entries.append((os.path.getmtime(full), full))
+            except OSError:
+                pass
+        entries.sort(reverse=True)
+        removed = 0
+        for _, full in entries[keep:]:
+            try:
+                if os.path.dirname(os.path.abspath(full)) != root:
+                    continue
+                _sh.rmtree(full)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+    except Exception:
+        return 0
+
+
 def _hq_cleanup_episode(series_id, episode):
     """删掉这一集的本地缓存（解密源 + H.264 转码产物）。
 

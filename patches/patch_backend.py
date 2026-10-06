@@ -189,6 +189,51 @@ CLEANUP_BLOCK = '''
 
 
 # ---- 本地维护: 看过的集自动清理缓存 ----
+def _hq_sweep_stale_sessions(root=None, keep=1):
+    """清扫上次运行遗留的 HLS 工作目录。
+
+    2026-10-07 实测：应用数据目录里积了 31 个 desktop-hls-* 目录，
+    其中 6 个残留合计 1.89 GB。设计上由 Rust 父进程在退出时删除，
+    但后端被强杀/崩溃时不会执行，目录就永久留下了。
+    这里在启动时清一次：只删「工作根目录下的 UUID 子目录」，保留最新的一个。
+
+    注意：必须定义在 server.py 的模块级调用之前，
+    否则会 NameError（2026-10-07 踩过，后端直接起不来）。
+    """
+    import re as _re
+    import shutil as _sh
+    root = root or os.environ.get("HONGGUO_HLS_WORK_DIR") or ""
+    if not root or not os.path.isdir(root):
+        return 0
+    root = os.path.abspath(root)
+    try:
+        entries = []
+        for name in os.listdir(root):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            # 只认 UUID 形态的子目录，绝不碰其他内容。
+            if not _re.fullmatch(r"[0-9a-fA-F-]{8,64}", name):
+                continue
+            try:
+                entries.append((os.path.getmtime(full), full))
+            except OSError:
+                pass
+        entries.sort(reverse=True)
+        removed = 0
+        for _, full in entries[keep:]:
+            try:
+                if os.path.dirname(os.path.abspath(full)) != root:
+                    continue
+                _sh.rmtree(full)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+    except Exception:
+        return 0
+
+
 def _hq_cleanup_episode(series_id, episode):
     """删掉这一集的本地缓存（解密源 + H.264 转码产物）。
 
@@ -401,6 +446,46 @@ def patch_server(src_dir, out_dir):
     s = sub_once(s, re.escape(CLEANUP_CALL_OLD), CLEANUP_CALL_NEW, "缓存上限回收")
     # 清理接口 + 帮助函数：追加到文件末尾
     s = s.rstrip("\n") + "\n" + CLEANUP_BLOCK
+    # 启动时清扫上次运行遗留的 HLS 工作目录（强杀/崩溃会留下 GB 级残留）。
+    s = sub_once(
+        s,
+        re.escape('_desktop_jobs = HlsJobs(os.environ["HONGGUO_HLS_WORK_DIR"], _desktop_source)'),
+        # 直接内联：CLEANUP_BLOCK 追加在文件末尾，
+        # 若把函数定义放在那里、调用放在这里，会 NameError（后端起不来）。
+        'try:\n'
+        # HONGGUO_HLS_WORK_DIR 指向「本次会话」目录（形如 desktop-hls-XXXXXX），
+        # 上次崩溃遗留的是它的**兄弟目录**，所以要扫父目录。
+        '        _hq_cur = os.path.abspath(os.environ["HONGGUO_HLS_WORK_DIR"])\n'
+        '        _hq_parent = os.path.dirname(_hq_cur)\n'
+        '        import shutil as _hq_sh\n'
+        '        for _n in os.listdir(_hq_parent):\n'
+        '            if not _n.startswith("desktop-hls-"):\n'
+        '                continue\n'
+        '            _old = os.path.join(_hq_parent, _n)\n'
+        '            if os.path.abspath(_old) == _hq_cur:\n'
+        '                continue\n'
+        '            if not os.path.isdir(_old) or os.path.islink(_old):\n'
+        '                continue\n'
+        '            if os.path.dirname(os.path.abspath(_old)) != _hq_parent:\n'
+        '                continue\n'
+        '            try:\n'
+        '                _hq_sh.rmtree(_old)\n'
+        '            except OSError:\n'
+        '                pass\n'
+        '    except Exception:\n'
+        '        pass\n'
+        '    _desktop_jobs = HlsJobs(os.environ["HONGGUO_HLS_WORK_DIR"], _desktop_source)',
+        "启动清扫残留工作目录")
+    # /search 缺少输入校验：空串或超长查询会直接打到上游，
+    # 被风控拦下后返回 500（实测 81 字符即触发）。这里在入口挡住。
+    s = sub_once(
+        s,
+        re.escape('    try:\n        return {"query": q, "results": H.search(q, max_items=limit)}'),
+        '    _q = (q or "").strip()\n'
+        '    if not _q or len(_q) > 80:\n'
+        '        raise HTTPException(400, "Invalid search query")\n'
+        '    try:\n        return {"query": _q, "results": H.search(_q, max_items=limit)}',
+        "search 输入校验")
     io.open(p_out, "w", encoding="utf-8", newline="").write(s)
     print("OK   server.py  (清晰度 + 缓存直通 + 看过自动清理)")
 
