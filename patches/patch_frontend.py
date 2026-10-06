@@ -52,27 +52,26 @@ POST_RETRY = re.compile(
 
 
 # ---- 本地维护: 自动连播时不弹控制栏/鼠标 ----
-# 切集时旧集的 ended/pause 会触发 G()（延时隐藏），而新集
-# playing 会立即 z(!0) 把控制栏变可见，于是每次自动连播都弹一下。
-# 这里在自动连播路径上打一个短暂的“不要弹”窗口。
-CONTROLS_GUARD_DECL = (
-    "it=P.useRef(null),ye=P.useRef(0),Se=P.useRef(null),He=P.useRef(null)," + 
-    "hqNoChromeUntil=P.useRef(0),"
-)
-CONTROLS_GUARD_DECL_OLD = "it=P.useRef(null),ye=P.useRef(0),Se=P.useRef(null),He=P.useRef(null),"
-
-# 自动连播：记下时间戳，跳过下一集的首次 playing
-CONTROLS_GUARD_ARM_OLD = "ve&&C.episode<Pt&&Ri(C.episode+1)"
-CONTROLS_GUARD_ARM_NEW = (
-    "ve&&C.episode<Pt&&(hqNoChromeUntil.current=performance.now()+1500,"
-    "Ri(C.episode+1))"
+# 切集时旧集 ended/pause 会触发延时隐藏，而新集 playing 会立即
+# 无条件把控制栏变可见，所以每次自动连播都会弹一下。
+# 这里用一个标志位：自动连播时置位，跳过新集首次 playing；
+# 一旦进入正常隐藏周期（G）或用户主动操作，就清掉。
+# 不用定时窗口，避免切集耗时超过窗口时失效。
+CONTROLS_DECL_OLD = "it=P.useRef(null),ye=P.useRef(0),Se=P.useRef(null),He=P.useRef(null),"
+CONTROLS_DECL_NEW = (
+    "it=P.useRef(null),ye=P.useRef(0),Se=P.useRef(null),He=P.useRef(null),"
+    "hqAutoAdvance=P.useRef(!1),"
 )
 
-# jR 接收该戳以及当前时间函数
+# 自动连播：置位标志
+AUTOARM_OLD = "ve&&C.episode<Pt&&Ri(C.episode+1)"
+AUTOARM_NEW = "ve&&C.episode<Pt&&(hqAutoAdvance.current=!0,Ri(C.episode+1))"
+
+# 播放器组件接收标志引用
 JR_PROPS_OLD = "ignoreButtonClickDuringAcceptancePlayback:D=!1,onAcceptanceButtonClickIgnored:M}){"
 JR_PROPS_NEW = (
     "ignoreButtonClickDuringAcceptancePlayback:D=!1,onAcceptanceButtonClickIgnored:M,"
-    "noChromeUntil:hqNoChromeUntil=null,nowFn:hqNow=Date.now}){"
+    "autoAdvanceRef:hqAutoAdvance=null}){"
 )
 
 JR_CALL_OLD = (
@@ -81,14 +80,18 @@ JR_CALL_OLD = (
 )
 JR_CALL_NEW = (
     'ignoreButtonClickDuringAcceptancePlayback:p,onAcceptanceButtonClickIgnored:E?ae=>ci({kind:"buttonClickIgnored",'
-    'inputSource:"button",inputTrusted:ae}):void 0,noChromeUntil:hqNoChromeUntil,nowFn:()=>performance.now()})]'
+    'inputSource:"button",inputTrusted:ae}):void 0,autoAdvanceRef:hqAutoAdvance})]'
 )
+
+# 正常隐藏周期开始时清掉标志（用户主动操作会路过这里）
+JR_HIDE_OLD = "function G(){clearTimeout(V.current),"
+JR_HIDE_NEW = "function G(){hqAutoAdvance&&(hqAutoAdvance.current=!1),clearTimeout(V.current),"
 
 # 自动连播后的首次 playing 不把控制栏变可见
 JR_PLAYING_OLD = "q(\"\"),$(\"播放中\"),z(!0),W(!1),Ft&&vt.current?.media!==De&&or(De)"
 JR_PLAYING_NEW = (
     'q(""),$("播放中"),'
-    '(hqNoChromeUntil&&hqNoChromeUntil.current&&hqNow()<hqNoChromeUntil.current)||z(!0),'
+    '(hqAutoAdvance&&hqAutoAdvance.current)||z(!0),'
     'W(!1),Ft&&vt.current?.media!==De&&or(De)'
 )
 
@@ -255,10 +258,11 @@ def patch(text):
     # 动画循环：旧集 ended/pause -> G()（延时隐藏）-> 新集 playing -> z(!0)
     # 把控制栏变可见。在自动连播路径上打开一个短窗口，
     # 跳过新集的首次 playing，使控制栏保持隐藏、鼠标保持隐藏。
-    p.sub(re.escape(CONTROLS_GUARD_DECL_OLD), CONTROLS_GUARD_DECL, "控制栏保护 ref")
-    p.sub(re.escape(CONTROLS_GUARD_ARM_OLD), CONTROLS_GUARD_ARM_NEW, "自动连播打开保护窗口")
-    p.sub(re.escape(JR_PROPS_OLD), JR_PROPS_NEW, "播放器组件接收保护参数")
+    p.sub(re.escape(CONTROLS_DECL_OLD), CONTROLS_DECL_NEW, "自动连播标志位")
+    p.sub(re.escape(AUTOARM_OLD), AUTOARM_NEW, "自动连播置位标志")
+    p.sub(re.escape(JR_PROPS_OLD), JR_PROPS_NEW, "播放器组件接收标志引用")
     p.sub(re.escape(JR_CALL_OLD), JR_CALL_NEW, "播放器组件传参")
+    p.sub(re.escape(JR_HIDE_OLD), JR_HIDE_NEW, "隐藏周期清掉标志")
     p.sub(re.escape(JR_PLAYING_OLD), JR_PLAYING_NEW, "首次 playing 不弹控制栏")
 
     # ===== 13) 键盘白名单放行新按键 =====
