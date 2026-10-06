@@ -175,3 +175,35 @@ F. tools/deploy.ps1 + tools/restore.ps1 + tools/auto_patch.py
   - 核对 base/ 的 5 个后端文件与 3 个前端文件均与上游原版逐字节相同；
   - 最终 exe FileVersion = 1.0.9，dist 与安装目录哈希一致。
 
+--------------------------------------------------------------
+六、自动重注入端到端复验（对应「更新后自动重新注入」需求）
+--------------------------------------------------------------
+步骤:
+  1. 把安装目录的 exe 与后端 4 个文件全部换回上游原版
+     （模拟软件内更新 / 重装）：
+       exe sha256 = be60068affc6f6da…
+       tools/auto_patch.py status -> 已打补丁: False
+  2. 运行 python tools/auto_patch.py apply
+
+结果:
+  - 从 exe 内嵌资源取出原版前端并重新注入（22 项探针/替换全部命中）
+  - /assets/index-CEHZDRVO.js: 291248 -> 268969
+  - /assets/index-BgVmhdUf.css: 10441 -> 9802
+  - /index.html: 248 -> 228（资源引用已对齐到 exe 内真实键名）
+  - 后端 4 个文件全部重新注入：
+      server.py / desktop_hls.py / desktop_hls_service.py / desktop_encode.py
+  - [OK] 补丁已重新注入
+
+一致性核对:
+  自动重注入后的 exe sha256 = 9253cf208525f2fe286afbd9…（与手工构建的 dist 完全一致）
+  server.py / desktop_hls.py / desktop_hls_service.py / desktop_encode.py
+  四个文件均与 src/backend 逐一相等
+
+启动后实测:
+  第 802/1000 集 · 播放中，1920x1080，无中断提示
+  清晰度档位: auto/1080p/720p/540p/480p
+  倍速档位  : 0.75/1/1.25/1.5/2/2.5/3
+  空格切换播放/暂停，焦点按钮点击次数 = 0
+  [ / ] 调档 3 → 2.5 → 3；> 前进约 12s；S 循环 true/false
+
+结论: 「上游更新后自动重新注入」链路可用，且产出与手工构建逐字节一致。

@@ -1,11 +1,11 @@
---- base/backend/desktop_hls_service.py
-+++ src/backend/desktop_hls_service.py
+--- a/base/backend/desktop_hls_service.py
++++ b/src/backend/desktop_hls_service.py
 @@ -38,12 +38,13 @@
  
  
  class HlsJobs:
 -    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=4, max_workers=2, idle_seconds=300):
-+    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=6, max_workers=3, idle_seconds=300, queue_wait=8.0):
++    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=8, max_workers=3, idle_seconds=300, queue_wait=6.0):
          self.root = Path(root).resolve(strict=True)
          if not self.root.is_dir() or self.root.is_symlink():
              raise ValueError("Desktop work directory is unavailable")

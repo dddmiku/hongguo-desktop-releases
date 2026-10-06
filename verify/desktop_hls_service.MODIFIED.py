@@ -38,7 +38,7 @@ class Job:
 
 
 class HlsJobs:
-    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=6, max_workers=3, idle_seconds=300, queue_wait=8.0):
+    def __init__(self, root, source_loader, *, encoder=encode_hls, max_jobs=8, max_workers=3, idle_seconds=300, queue_wait=6.0):
         self.root = Path(root).resolve(strict=True)
         if not self.root.is_dir() or self.root.is_symlink():
             raise ValueError("Desktop work directory is unavailable")
