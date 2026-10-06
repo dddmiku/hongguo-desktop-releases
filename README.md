@@ -3,7 +3,7 @@
 上游发行版 `waligoraamodio288-rgb/hongguo-desktop-releases`（红果短剧电脑版 / 红果桌面版）
 的本地二次维护。**上游每次发版后都能自动重新注入补丁**。
 
-当前基线：**1.0.9**（原版 exe sha256 `be60068a…`）。
+当前基线：**1.0.9**（原版 exe sha256 `be60068affc6f6da…`）。
 
 ## 新增能力
 
