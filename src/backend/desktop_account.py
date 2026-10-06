@@ -332,7 +332,14 @@ def _json(response):
 
 
 # ---- 验证码登录 -----------------------------------------------------------
-def _passport_form(mobile=None, code=None):
+def _passport_form(mobile=None, code=None, with_device=False):
+    """构造护照表单。
+
+    with_device=True 时把设备参数也编进请求体 —— 真机就是这么发的
+    （sms_login 请求体 55 个字段，设备字段和业务字段在同一个表单里）。
+    只放 URL query 不生效：服务端校验的是请求体。
+    """
+    from urllib.parse import quote
     parts = []
     if mobile:
         parts.append("mobile=" + xor_hex(mobile))
@@ -343,6 +350,11 @@ def _passport_form(mobile=None, code=None):
         "passport_support_flow=captcha%2Cverify",
         "mix_mode=1",
     ]
+    if with_device:
+        for key, value in passport_query().items():
+            if key in ("_rticket", "passport-sdk-version"):
+                continue
+            parts.append("%s=%s" % (key, quote(str(value), safe="")))
     return "&".join(parts)
 
 
@@ -366,7 +378,7 @@ def send_code(mobile):
     mobile = re.sub(r"\D", "", str(mobile or ""))
     if not re.fullmatch(r"1\d{10}", mobile):
         return {"ok": False, "error": "手机号格式不正确"}
-    form = (_passport_form(mobile=mobile) + "&type=" + xor_hex(SMS_TYPE)
+    form = (_passport_form(mobile=mobile, with_device=True) + "&type=" + xor_hex(SMS_TYPE)
             + "&unbind_exist=" + xor_hex("1") + "&auto_read=0")
     r = _call("POST", "/passport/mobile/send_code/v1/", form=form,
               session={}, host=PASSPORT_HOST, passport=True)
@@ -429,7 +441,7 @@ def sms_login(mobile, code):
         return {"ok": False, "error": "手机号格式不正确"}
     if not re.fullmatch(r"\d{4,8}", code):
         return {"ok": False, "error": "验证码格式不正确"}
-    form = _passport_form(mobile=mobile, code=code)
+    form = _passport_form(mobile=mobile, code=code, with_device=True)
     r = _call("POST", "/passport/mobile/sms_login/", form=form,
               session={}, host=PASSPORT_HOST, passport=True)
     j = _json(r)
