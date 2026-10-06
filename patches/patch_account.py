@@ -39,36 +39,74 @@ return hqAcctCall("/desktop/account/favorite",{series_id:String(seriesId),
 favorite:favorite?"true":"false"},"POST",null)}
 '''
 
-PANEL = r'''
-function hqAccountPanel({initialStatus}){const[n,a]=REACT.useState(initialStatus||null),
-[o,c]=REACT.useState(""),[d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState("");
+PANEL = r"""
+function hqAccountPanel(){const[n,a]=REACT.useState(null),[o,c]=REACT.useState(""),
+[d,f]=REACT.useState(""),[g,m]=REACT.useState(!1),[p,v]=REACT.useState(""),[E,T]=REACT.useState("");
 REACT.useEffect(()=>{let x=!0;hqAcctCall("/desktop/account/status",null,"GET",null).then(A=>{x&&A&&a(A)});return()=>{x=!1}},[]);
-async function L(){if(!hqApi()){v("请先播放任意一集（本机服务地址会随后记录），再回到这里登录。");return}
-m(!0),v("");try{const x=await hqAcctCall("/desktop/account/send_code",{mobile:o},"POST",null);
-x?v("验证码已发送，请查看手机短信。"):v("验证码发送失败，请检查手机号。")}finally{m(!1)}}
-async function R(){if(!hqApi()){v("请先播放任意一集，再回到这里登录。");return}
-m(!0),v("");try{const x=await hqAcctCall("/desktop/account/login",{mobile:o,code:d},"POST",null);
-if(x&&x.loggedIn){a(x),T(""),v("登录成功，观看进度与收藏会同步到手机。")}else v("登录失败，请检查验证码。")}finally{m(!1)}}
-async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/logout",null,"POST",null);a(x||{loggedIn:!1}),v("已退出账号同步。")}finally{m(!1)}}
+function hqErr(e){return e&&e.message?String(e.message).slice(0,200):"请求失败"}
+async function hqPost(path,q){const v=hqApi();if(!v)throw new Error("请先播放任意一集（本机服务地址会随后记录），再回到这里登录。");
+const u=new URL(v.origin+path);Object.entries(q).forEach(([k,x])=>u.searchParams.set(k,x));
+const r=await fetch(u.toString(),{method:"POST",headers:{"x-api-key":v.key},credentials:"omit",redirect:"error"});
+if(!r.ok){let d="";try{d=(await r.json()).detail||""}catch(x){}throw new Error(d||("HTTP "+r.status))}
+return r.json().catch(()=>null)}
+async function L(){m(!0),v("");try{await hqPost("/desktop/account/send_code",{mobile:o});
+v("验证码已发送，请查看手机短信。"),T("")}catch(e){v("发送失败："+hqErr(e)),T("error")}finally{m(!1)}}
+async function R(){m(!0),v("");try{const x=await hqPost("/desktop/account/login",{mobile:o,code:d});
+if(x&&x.loggedIn){a(x),f(""),v("登录成功，观看进度与收藏会同步到手机。"),T("")}else{v("登录失败：响应异常"),T("error")}}catch(e){v("登录失败："+hqErr(e)),T("error")}finally{m(!1)}}
+async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/logout",null,"POST",null);
+a(x||{loggedIn:!1}),v("已退出账号同步。"),T("")}finally{m(!1)}}
+const A=!!(n&&n.loggedIn);
 return JSX.jsxs("section",{className:"content account-page",children:[
 JSX.jsxs("div",{className:"headline-row",children:[JSX.jsxs("div",{children:[
 JSX.jsx("span",{className:"eyebrow",children:"红果账号同步"}),JSX.jsx("h1",{children:"验证码登录"})]}),
-n&&n.loggedIn?JSX.jsxs("button",{className:"secondary",onClick:()=>void D(),disabled:g,children:["退出登录"]}):null]}),
-JSX.jsxs("div",{className:"account-status-card "+(n&&n.loggedIn?"online":""),role:"status",children:[
-JSX.jsxs("div",{children:[JSX.jsx("strong",{children:n&&n.loggedIn?("已登录 · "+(n.userName||"红果账号")):"未登录"}),
-JSX.jsx("p",{children:n&&n.loggedIn?"桌面端看完的集数与收藏会同步到手机红果的历史/收藏里。"
+A?JSX.jsx("button",{className:"secondary",onClick:()=>void D(),disabled:g,children:"退出登录"}):null]}),
+JSX.jsxs("div",{className:"account-status-card "+(A?"online":""),role:"status",children:[
+JSX.jsxs("div",{children:[JSX.jsx("strong",{children:A?("已登录 · "+(n.userName||"红果账号")):"未登录"}),
+JSX.jsx("p",{children:A?"桌面端看完的集数与收藏会同步到手机红果的历史/收藏里。"
 :"登录后，桌面端看的进度与收藏会同步到手机；不登录也能正常看剧。"})]})]}),
-!n||!n.loggedIn?JSX.jsxs("div",{className:"account-login-card",children:[
-JSX.jsxs("div",{children:[JSX.jsx("h2",{children:"用手机号登录"}),JSX.jsx("p",{children:"验证码由红果下发；桌面端只保存登录态，不上传任何账号密码。"})]}),
-JSX.jsxs("label",{className:"settings-row",children:[JSX.jsx("span",{children:"手机号"}),JSX.jsx("input",{type:"tel",inputMode:"numeric",value:o,
-placeholder:"11 位手机号",onChange:x=>c(x.target.value.replace(/\D/g,"").slice(0,11))})]}),
-JSX.jsxs("label",{className:"settings-row",children:[JSX.jsx("span",{children:"验证码"}),JSX.jsx("input",{type:"tel",inputMode:"numeric",value:d,
-placeholder:"短信验证码",onChange:x=>f(x.target.value.replace(/\D/g,"").slice(0,8))})]}),
-JSX.jsxs("div",{className:"qr-login-actions",children:[
+A?null:JSX.jsxs("div",{className:"hq-acct-card",children:[
+JSX.jsxs("div",{children:[JSX.jsx("h2",{children:"用手机号登录"}),
+JSX.jsx("p",{className:"hq-acct-intro",children:"验证码由红果下发；桌面端只保存登录态，不上传任何账号密码。"})]}),
+JSX.jsxs("label",{className:"hq-acct-row",children:[JSX.jsx("span",{children:"手机号"}),
+JSX.jsx("input",{type:"tel",inputMode:"numeric",autoComplete:"off",value:o,placeholder:"11 位手机号",
+onChange:x=>c(x.target.value.replace(/\D/g,"").slice(0,11))})]}),
+JSX.jsxs("label",{className:"hq-acct-row",children:[JSX.jsx("span",{children:"验证码"}),
+JSX.jsx("input",{type:"tel",inputMode:"numeric",autoComplete:"off",value:d,placeholder:"短信验证码",
+onChange:x=>f(x.target.value.replace(/\D/g,"").slice(0,8))})]}),
+JSX.jsxs("div",{className:"hq-acct-actions",children:[
 JSX.jsx("button",{className:"secondary",onClick:()=>void L(),disabled:g||o.length!==11,children:"发送验证码"}),
-JSX.jsx("button",{className:"primary",onClick:()=>void R(),disabled:g||o.length!==11||d.length<4,children:g?"处理中…":"登录"})]})]}):null,
-p?JSX.jsx("p",{role:"status",className:"account-boundary",children:p}):null]})}
-'''
+JSX.jsx("button",{className:"primary",onClick:()=>void R(),disabled:g||o.length!==11||d.length<4,
+children:g?"处理中…":"登录"})]})]}),
+p?JSX.jsx("p",{className:"hq-acct-note"+(E?" error":""),role:"status",children:p}):null]})}
+"""
+
+# 专属样式：上游的 account-login-card 是「图标|文案|按钮」三列网格，
+# settings-row 的 input 又是给 18px 复选框用的，套过来会被挤成窄条。
+# 所以这里用自己的类名，只借用上游的设计变量。
+CSS = """
+.hq-acct-card{display:block;max-width:760px;padding:24px 26px;border:1px solid var(--line);
+border-radius:19px;background:var(--paper);box-shadow:0 10px 34px #412b210b}
+.hq-acct-card h2{margin:0 0 6px;font-size:20px;letter-spacing:-.025em}
+.hq-acct-intro{margin:0 0 18px;color:var(--muted);font-size:13px;line-height:1.6}
+.hq-acct-row{display:grid;grid-template-columns:88px minmax(0,1fr);align-items:center;
+gap:16px;min-height:64px;border-bottom:1px solid var(--line);font-size:14px}
+.hq-acct-row>span{color:var(--ink)}
+.hq-acct-row input{width:100%;min-width:0;box-sizing:border-box;height:40px;padding:0 12px;
+font-size:14px;color:var(--ink);background:#fff;border:1px solid var(--line);
+border-radius:10px;outline:none;appearance:none}
+.hq-acct-row input::placeholder{color:var(--muted)}
+.hq-acct-row input:focus{border-color:var(--coral)}
+.hq-acct-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px}
+.hq-acct-note{margin:16px 0 0;font-size:13px;line-height:1.6;color:var(--muted)}
+.hq-acct-note.error{color:#c0392b}
+"""
+
+
+def patch_css(text):
+    """把专属样式追加到 app.css（幂等）。"""
+    if ".hq-acct-card" in text:
+        return text, ["[=] 账号样式已存在，跳过"]
+    return text.rstrip("\n") + "\n" + CSS.strip() + "\n", ["OK   追加账号面板样式"]
 
 class Fail(SystemExit):
     pass

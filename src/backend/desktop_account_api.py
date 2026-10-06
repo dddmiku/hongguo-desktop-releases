@@ -27,15 +27,24 @@ def register(app):
         result = A.send_code(mobile)
         if not result.get("ok"):
             raise HTTPException(400, str(result.get("error") or "验证码发送失败"))
-        return {"sent": True}
+        return {"sent": True, "hasTicket": bool(result.get("hasTicket")),
+                "retryTime": result.get("retryTime")}
 
     @app.post("/desktop/account/login")
     def desktop_account_login(mobile: str = Query(..., min_length=11, max_length=11),
                               code: str = Query(..., min_length=4, max_length=8)):
         result = A.sms_login(mobile, code)
         if not result.get("ok"):
-            raise HTTPException(400, str(result.get("error") or "登录失败"))
+            detail = str(result.get("error") or "登录失败")
+            if result.get("error_code") is not None:
+                detail = "%s（错误码 %s）" % (detail, result["error_code"])
+            raise HTTPException(400, detail)
         return result["session"]
+
+    @app.get("/desktop/account/log")
+    def desktop_account_log(limit: int = Query(30, ge=1, le=200)):
+        """排查用：返回最近的账号操作记录（不含任何凭据）。"""
+        return {"path": A.LOG_PATH, "items": A.read_log(limit)}
 
     @app.post("/desktop/account/logout")
     def desktop_account_logout():

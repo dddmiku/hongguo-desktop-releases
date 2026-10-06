@@ -433,8 +433,17 @@ def main():
     for extra in ("app.css", "index.html"):
         cand = os.path.join(src_dir, extra)
         if os.path.isfile(cand):
-            io.open(os.path.join(dst_dir, extra), "w", encoding="utf-8", newline="").write(
-                io.open(cand, encoding="utf-8").read())
+            body = io.open(cand, encoding="utf-8").read()
+            if extra == "app.css":
+                # 账号面板的专属样式跟着 css 一起走，上游换版本也不会丢。
+                try:
+                    import patch_account
+                    body, css_log = patch_account.patch_css(body)
+                    for line in css_log:
+                        print(line)
+                except ImportError:
+                    pass
+            io.open(os.path.join(dst_dir, extra), "w", encoding="utf-8", newline="").write(body)
             print("OK   同步", extra)
     for line in p.log:
         print(line)

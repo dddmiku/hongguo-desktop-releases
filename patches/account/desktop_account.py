@@ -38,11 +38,56 @@ SESSION_PATH = os.environ.get("HONGGUO_ACCOUNT_FILE") or os.path.join(
     _DATA_DIR, "desktop-account.json")
 
 # 验证码登录接口所在的 host（与主 API host 不同）
-PASSPORT_HOST = os.environ.get("HONGGUO_PASSPORT_HOST", "api5-normal-lf.fqnovel.com")
+PASSPORT_HOST = os.environ.get("HONGGUO_PASSPORT_HOST", "security.snssdk.com")
 SMS_TYPE = os.environ.get("HONGGUO_SMS_TYPE", "24")   # 抓包: type=24 → 登录场景
 
 _lock = threading.RLock()
 _cache = None
+
+# ---- 诊断日志 -------------------------------------------------------------
+# 登录失败时用户没有可查的证据，所以每次护照调用都留一条记录。
+# 绝不记录 token / cookie / 完整手机号 / 完整验证码。
+LOG_PATH = os.environ.get("HONGGUO_ACCOUNT_LOG") or os.path.join(_DATA_DIR, "account-log.jsonl")
+LOG_MAX_BYTES = 512 * 1024
+
+
+def mask_mobile(value):
+    text = re.sub(r"\D", "", str(value or ""))
+    if len(text) < 7:
+        return "***"
+    return text[:3] + "****" + text[-4:]
+
+
+def log_event(event, **fields):
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        try:
+            if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                os.replace(LOG_PATH, LOG_PATH + ".1")
+        except OSError:
+            pass
+        record = {"t": int(time.time() * 1000), "event": event}
+        record.update(fields)
+        with io.open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_log(limit=50):
+    items = []
+    try:
+        for line in io.open(LOG_PATH, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return items[-int(limit):]
 
 
 # ---- 编解码 ---------------------------------------------------------------
@@ -192,8 +237,17 @@ def send_code(mobile):
               session={}, host=PASSPORT_HOST)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
+    data = j.get("data") if isinstance(j.get("data"), dict) else {}
+    log_event("send_code", host=PASSPORT_HOST, http=r.status_code, ok=ok,
+              mobile=mask_mobile(mobile), type=SMS_TYPE,
+              error_code=err_code, message=str(j.get("message"))[:80],
+              description=str(data.get("description") or why)[:120],
+              has_ticket=bool(data.get("mobile_ticket")),
+              retry_time=data.get("retry_time"))
     return {"ok": ok, "code": j.get("code"), "message": j.get("message"),
             "error": "" if ok else why, "error_code": err_code,
+            "hasTicket": bool(data.get("mobile_ticket")),
+            "retryTime": data.get("retry_time"),
             "data": j.get("data"), "http": r.status_code}
 
 
@@ -245,13 +299,21 @@ def sms_login(mobile, code):
               session={}, host=PASSPORT_HOST)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
+    data = j.get("data") if isinstance(j.get("data"), dict) else {}
     if not ok:
+        log_event("sms_login_failed", host=PASSPORT_HOST, http=r.status_code,
+                  mobile=mask_mobile(mobile), code_len=len(code),
+                  error_code=err_code, message=str(j.get("message"))[:80],
+                  description=str(data.get("description") or why)[:120])
         return {"ok": False, "code": err_code if err_code is not None else j.get("code"),
-                "error": why or "登录失败", "http": r.status_code}
+                "error": why or "登录失败", "error_code": err_code,
+                "http": r.status_code}
     session = _extract_session(r, {})
     session["saved_at"] = int(time.time())
     session["mobile"] = mobile
     save_session(session)
+    log_event("sms_login_ok", host=PASSPORT_HOST, http=r.status_code,
+              mobile=mask_mobile(mobile), has_cookie=bool(session.get("cookie")))
     # 立刻用登录态拉一次账号信息，确认真的可用
     info = _json(_call("GET", "/reading/user/info/v", session=session))
     if isinstance(info.get("data"), dict):
