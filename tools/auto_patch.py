@@ -30,7 +30,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "patches"))
-from tauri_assets import Assets          # noqa: E402
+from tauri_assets import (Assets, load_capacities, save_capacities,  # noqa: E402
+                          capacity_path)
 import patch_frontend                    # noqa: E402
 import patch_backend                     # noqa: E402
 from repack import align_index_html      # noqa: E402
@@ -82,15 +83,32 @@ def frontend_names(keys):
     return out
 
 
+# exe 内嵌前端「全部前端补丁都已就位」的判据。
+# 只查 hqQuals 是不够的：任何一版打过补丁的前端都含它，
+# 于是上游更新后、或者我们自己加了新前端补丁后，
+# is_patched() 一律返回 True，exe 永远不会被重新注入。
+# 这里逐个列出当前补丁链产出的关键标记。
+EXE_FULL_MARKERS = (
+    b"hqQuals",              # 清晰度档位
+    b"hqAccountPanel",       # 账号面板
+    b"hqRefreshLibrary",     # 历史自动刷新
+    b"hqPersistMerged",      # 合并结果落盘
+    b"hqPruneCache",         # 关播放器回收缓存
+    b"fromUid",              # 换号隔离
+    b"hqAutoAdvance",        # 自动连播不弹控制栏
+)
+
+
 def is_patched(exe):
-    """exe 内嵌前端是否已含我们的补丁。"""
+    """exe 内嵌前端是否已含我们的全部补丁。"""
     try:
         a = Assets(exe)
         found = a.find()
         js = next((e for k, e in found.items() if k.endswith(".js")), None)
         if not js:
             return False
-        return b"hqQuals" in js["raw"]
+        raw = js["raw"]
+        return all(m in raw for m in EXE_FULL_MARKERS)
     except Exception:
         return False
 
@@ -338,17 +356,56 @@ def apply_patches():
     for key, entry in found.items():
         io.open(os.path.join(orig_dir, names[key]), "wb").write(entry["raw"])
 
-    # 2) 套用前端补丁
+    # 1b) 兜底：exe 里的前端可能已经是「旧版补丁」而不是上游原版
+    #     （例如我们自己加了新前端补丁、上游版本没变）。
+    #     前端补丁的探针假定输入是未打补丁的 js，对已打补丁的 js 会直接失败，
+    #     于是整条 apply 路径卡死、永远升不上去。
+    #     这时改用仓库里保存的上游原版（base/frontend）当输入。
     src_js = os.path.join(orig_dir, "app.js")
+    raw_js = io.open(src_js, encoding="utf-8").read()
+    if "hqQuals" in raw_js or "hqAccountPanel" in raw_js:
+        base_js = os.path.join(ROOT, "base", "frontend", "app.js")
+        if not os.path.isfile(base_js):
+            print("[FAIL] exe 内嵌前端已是旧版补丁，且找不到 base/frontend/app.js 作为原版")
+            print("       请先手工准备上游原版（base/frontend），再重跑 apply")
+            return 1
+        print("[*] exe 内嵌前端已是旧版补丁，改用 base/frontend 作为上游原版输入")
+        shutil.copy2(base_js, src_js)
+        for extra in ("app.css", "index.html"):
+            cand = os.path.join(ROOT, "base", "frontend", extra)
+            if os.path.isfile(cand):
+                shutil.copy2(cand, os.path.join(orig_dir, extra))
+        raw_js = io.open(src_js, encoding="utf-8").read()
+
+    # 2) 套用前端补丁
     dst_js = os.path.join(work, "app.js")
-    text = io.open(src_js, encoding="utf-8").read()
+    text = raw_js
     patcher = patch_frontend.patch(text)
+    # 账号同步补丁（验证码登录 / 进度 / 收藏 / 换号隔离）
+    try:
+        import patch_account
+        acc_text, acc_log = patch_account.patch(patcher.s)
+        patcher.s = acc_text
+        patcher.log.extend(acc_log)
+        # 账号面板样式也要跟着走，否则面板没有专属样式
+        css_path = os.path.join(orig_dir, "app.css")
+        if os.path.isfile(css_path):
+            body = io.open(css_path, encoding="utf-8").read()
+            body, css_log = patch_account.patch_css(body)
+            io.open(css_path, "w", encoding="utf-8", newline="").write(body)
+            patcher.log.extend(css_log)
+    except ImportError:
+        pass
     io.open(dst_js, "w", encoding="utf-8", newline="").write(patcher.s)
     for line in patcher.log:
         print("   ", line)
 
     # 3) 压回 exe
-    a2 = Assets(EXE)
+    # 必须带上容量记录：前端补丁会让 js 变大（本轮从 273729 涨到 276690），
+    # 而 exe 里每个资源的压缩容量是固定的。repack.py 会把扩容后的容量写进
+    # <exe>.blobcaps.json，这里不加载它就会直接失败：
+    #   [FAIL] 压缩后 276690 > 容量 273729（需扩容，当前不支持）
+    a2 = Assets(EXE, load_capacities(EXE))
     found2 = a2.find()
     keys2 = list(found2.keys())
     for key, entry in found2.items():
@@ -362,6 +419,10 @@ def apply_patches():
         print(f"   [OK] {key}: {old_len} -> {new_len}")
     tmp_exe = EXE + ".patched"
     a2.save(tmp_exe)
+    # 容量记录要跟着新 exe 一起落地，否则下次替换又会被旧容量卡住。
+    save_capacities(tmp_exe, a2.capacities)
+    if os.path.isfile(capacity_path(EXE)):
+        shutil.copy2(capacity_path(EXE), EXE + ".blobcaps.json.bak")
 
     # 4) 后端补丁：在安装目录的现有文件上直接打
     repair_backend()
