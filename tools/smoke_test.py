@@ -21,10 +21,12 @@
   python tools/smoke_test.py --live     # 同时检查安装目录
 """
 import hashlib
+import importlib.util
 import io
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -175,6 +177,78 @@ def test_markers():
         check("前端 进度取最新", "lastEpisode:cep" in f or "lastEpisode:cep" in f.replace(" ", ""))
         check("前端 合并结果落盘", "hqPersistMerged" in f)
         check("前端 关播放器回收缓存", "hqPruneCache" in f)
+        # 作者信息：本维护分支自己的仓库，原作者的仓库/邮箱/B站都不该出现。
+        check("前端 署名已换成本仓库",
+              "github.com/dddmiku/hongguo-desktop-releases" in f)
+        check("前端 无原作者残留",
+              not any(m in f for m in ("waligoraamodio288-rgb", "42310326",
+                                       "WaligoraAmodio288", "渠道有数")))
+
+
+def test_rebrand():
+    section("4c. exe 署名重打标（内嵌 tauri.conf.json）")
+    spec = importlib.util.spec_from_file_location(
+        "rebrand_exe", os.path.join(ROOT, "tools", "rebrand_exe.py"))
+    if spec is None:
+        check("跳过：找不到 rebrand_exe.py", True)
+        return
+    rb = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(rb)
+    except Exception as e:
+        check("rebrand_exe 可导入", False, "%s: %s" % (type(e).__name__, e))
+        return
+    check("rebrand_exe 可导入", True)
+    # 用一个「带原作者署名」的合成 exe 验证等长覆盖逻辑，不依赖真实 exe。
+    import struct
+    import tempfile
+    old = rb.build_author_json("https://github.com/waligoraamodio288-rgb/"
+                               "hongguo-desktop-releases", 794)
+    work = tempfile.mkdtemp(prefix="hqrb-")
+    fake = os.path.join(work, "fake.bin")
+    # 最小 PE：DOS 头 + PE 签名 + 1 个 .rdata 节，把 JSON 放进节里。
+    body = bytearray(b"\x00" * 0x400)
+    body[0:2] = b"MZ"
+    pe_off = 0x80
+    body[pe_off:pe_off + 4] = b"PE\x00\x00"
+    struct.pack_into("<H", body, pe_off + 6, 1)          # 1 个节
+    struct.pack_into("<H", body, pe_off + 20, 0xF0)      # opt header 大小
+    opt = pe_off + 24
+    struct.pack_into("<H", body, opt, 0x20b)             # PE32+
+    sec_fo = 0x200
+    sec_va = 0x1000
+    json_fo = 0x240
+    body[json_fo:json_fo + len(old)] = old
+    # 节头
+    o = opt + 0xF0
+    body[o:o + 8] = b".rdata\x00\x00"
+    struct.pack_into("<IIII", body, o + 8, 0x2000, sec_va, 0x2000, sec_fo)
+    struct.pack_into("<Q", body, opt + 24, 0x140000000)  # image base
+    # 长度立即数：lea rax,[rip+d] ; mov [rbp+0x90], imm32
+    lea = sec_fo + (json_fo - sec_fo) - 24
+    ib = 0x140000000
+    json_va = ib + sec_va + (json_fo - sec_fo)
+    body[lea] = 0x48
+    body[lea + 1] = 0x8D
+    body[lea + 2] = 0x05
+    lea_va = ib + sec_va + (lea - sec_fo)
+    struct.pack_into("<i", body, lea + 3, json_va - (lea_va + 7))
+    body[lea + 7] = 0x48
+    body[lea + 8] = 0xC7
+    body[lea + 9] = 0x85
+    struct.pack_into("<i", body, lea + 10, 0x90)
+    struct.pack_into("<i", body, lea + 14, len(old))
+    io.open(fake, "wb").write(bytes(body))
+    try:
+        rc = rb.rebrand_file(fake, repo="https://github.com/dddmiku/hongguo-desktop-releases")
+    except SystemExit as e:
+        check("合成 exe 重打标", False, str(e))
+        return
+    got = io.open(fake, "rb").read()
+    check("合成 exe 重打标返回 0", rc == 0, "rc=%d" % rc)
+    check("合成 exe 无原作者残留",
+          not any(m in got for m in rb.OLD_OWNER_MARKERS))
+    check("合成 exe 长度不变", len(got) == len(body))
 
 
 def test_patch_idempotency():
@@ -288,6 +362,9 @@ def test_auto_patch_ready():
     check("apply 加载 blobcaps 容量记录", "load_capacities(EXE)" in src)
     check("apply 会写回新容量", "save_capacities(tmp_exe" in src)
     check("apply 也套账号补丁", "patch_account.patch" in src)
+    # d) 上游发版后必须把署名一并补回来（前端标记全中也不能跳过）
+    check("apply 会重打作者署名", "rebrand_exe.rebrand_file(tmp_exe)" in src)
+    check("apply 检测署名缺失", "is_rebranded(EXE)" in src)
 
 
 def test_live():
@@ -312,6 +389,7 @@ def main():
     test_import_server()
     test_frontend_syntax()
     test_markers()
+    test_rebrand()
     test_patch_idempotency()
     test_auto_patch_ready()
     test_routes()

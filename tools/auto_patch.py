@@ -34,6 +34,7 @@ from tauri_assets import (Assets, load_capacities, save_capacities,  # noqa: E40
                           capacity_path)
 import patch_frontend                    # noqa: E402
 import patch_backend                     # noqa: E402
+import rebrand_exe                       # noqa: E402
 from repack import align_index_html      # noqa: E402
 
 APP_DIR = os.environ.get("HONGGUO_APP_DIR", r"d:\Users\dddmiku\AppData\Local\红果免费短剧")
@@ -98,6 +99,11 @@ EXE_FULL_MARKERS = (
     b"hqAutoAdvance",        # 自动连播不弹控制栏
 )
 
+# exe 内嵌 tauri.conf.json 是否已换成本维护分支的署名。
+# 上游发版会把 author 段和更新端点换回它自己的仓库/邮箱/B站地址，
+# 这里单独判一次：前端标记全中就跳过重注入时，仍要把署名补回来。
+REBRAND_MARKER = b"dddmiku/hongguo-desktop-releases"
+
 
 def is_patched(exe):
     """exe 内嵌前端是否已含我们的全部补丁。"""
@@ -111,6 +117,17 @@ def is_patched(exe):
         return all(m in raw for m in EXE_FULL_MARKERS)
     except Exception:
         return False
+
+
+def is_rebranded(exe):
+    """exe 内嵌 tauri.conf.json 是否已是本维护分支的署名（无原作者残留）。"""
+    try:
+        d = io.open(exe, "rb").read()
+    except OSError:
+        return False
+    if any(m in d for m in rebrand_exe.OLD_OWNER_MARKERS):
+        return False
+    return REBRAND_MARKER in d
 
 
 def backup_once(exe, backend):
@@ -326,6 +343,19 @@ def apply_patches():
     st = load_state()
     cur = sha(EXE)
 
+    # 作者信息单独判一次：上游发版会把内嵌 tauri.conf.json 的署名换回它自己的，
+    # 而前端标记可能仍然是全的（我们只改了 .rdata 字面量，没动资源）。
+    # 这种情况不能走「无需处理」，否则署名永远补不回来。
+    if is_patched(EXE) and not is_rebranded(EXE):
+        print("[*] 检测到内嵌署名仍是上游原版，重打标…")
+        if rebrand_exe.rebrand_file(EXE) != 0:
+            print("[FAIL] 作者信息重打标失败")
+            return 1
+        st["patched_exe_sha256"] = sha(EXE)
+        save_state(st)
+        print("[=] 署名已更新；检查后端…")
+        return repair_backend()
+
     # exe 已是补丁版且记录一致：仍然校验后端（上游更新可能只换后端）
     if st.get("patched_exe_sha256") == cur and is_patched(EXE):
         print("[=] exe 已是补丁版，检查后端…")
@@ -423,6 +453,14 @@ def apply_patches():
     save_capacities(tmp_exe, a2.capacities)
     if os.path.isfile(capacity_path(EXE)):
         shutil.copy2(capacity_path(EXE), EXE + ".blobcaps.json.bak")
+
+    # 3b) 作者信息重打标（内嵌 tauri.conf.json 里的 author 段与更新端点）。
+    #     上游发版会把这两处换回它自己的仓库/邮箱/B站地址，前端资源压回后
+    #     这里再统一覆盖一遍，保证「重新注入」出来的也是本维护分支的署名。
+    #     必须在 save 之后做：它改的是 exe 的 .rdata 字面量，与资源无关。
+    if rebrand_exe.rebrand_file(tmp_exe) != 0:
+        print("[FAIL] 作者信息重打标失败")
+        return 1
 
     # 4) 后端补丁：在安装目录的现有文件上直接打
     repair_backend()

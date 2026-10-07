@@ -22,6 +22,34 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEED_OLD = "[.75,1,1.25,1.5,2]"
 SPEED_NEW = "[.75,1,1.25,1.5,2,2.5,3]"
 
+# ---- 作者信息（本维护分支自己的发布仓库） ----
+# 上游把作者信息写死在 app.js 的 kR/MR/OR 三个常量里（前端「更新与反馈」
+# 面板用它渲染）。exe 里另有一份编译进 tauri.conf.json 的字面量，由
+# tools/rebrand_exe.py 在重打包时处理 —— 那一条不是资源、也没有指针引用，
+# 长度是编译期立即数，只能等长替换。
+DIST_REPO = "https://github.com/dddmiku/hongguo-desktop-releases"
+DIST_ISSUES = DIST_REPO + "/issues/new/choose"
+# 三个入口统一指向本仓库：关注 -> 仓库主页，反馈 / 需求 -> 新建 issue。
+# 需求入口原来是 mailto:，改成 URL 后前端那句 `E=r==="request"`（用邮箱口径
+# 渲染文案）必须跟着关掉，否则按钮会显示「复制邮箱」而值是地址。
+AUTHOR_SLOT_RE = {
+    "kR": ("作者信息·关注入口", DIST_REPO),
+    "MR": ("作者信息·反馈入口", DIST_ISSUES),
+    "OR": ("作者信息·需求入口", DIST_ISSUES),
+}
+REQUEST_IS_MAIL = 'E=r==="request",'
+REQUEST_IS_URL = "E=!1,"
+INTRO_OLD = "软件由渠道有数维护。欢迎主动关注、反馈问题或提出工具需求。"
+INTRO_NEW = "软件由本地维护分支发布。欢迎关注、反馈问题或提出工具需求。"
+FOOTNOTE_OLD = "GitHub 反馈需要登录；也可以使用上方邮箱联系作者。邮件由你自行撰写和发送。"
+FOOTNOTE_NEW = "反馈与工具需求都通过 GitHub 提交，需要登录 GitHub 账号。"
+NK_AUTHOR_OLD = ('{destination:"author",title:"关注作者",'
+                 'description:"了解新版本和接下来做的小工具。",'
+                 'action:"关注作者，获取更新"}')
+NK_AUTHOR_NEW = ('{destination:"author",title:"关注项目",'
+                 'description:"了解新版本和接下来做的小工具。",'
+                 'action:"打开项目主页"}')
+
 QUAL_HELPERS = (
     'function hqQuals(){return["auto","1080p","720p","540p","480p"]}'
     'function hqReadQual(){try{const r=localStorage.getItem("guoban:quality")||"auto";'
@@ -466,6 +494,24 @@ def patch(text):
         p.log.append("OK   屏蔽官方更新通道")
     else:
         p.log.append("!!   未找到更新桥（上游可能改名，需人工确认）")
+
+    # ===== 16) 作者信息替换（本维护分支自己的发布仓库） =====
+    # 三个常量长这样（上游每版都重新压缩，但变量名 kR/MR/OR 稳定）：
+    #   kR={url:"...",copyValue:"..."},MR={...},OR={...},PR={author:kR,...},pm=PR
+    # 用带捕获组的正则回填，避免依赖具体 URL 字面量。
+    for var, (label, new_url) in AUTHOR_SLOT_RE.items():
+        pat = (re.escape(var) + r'=\{url:"[^"]*",copyValue:"[^"]*"\}')
+        p.sub(pat, lambda m, u=new_url, v=var: '%s={url:"%s",copyValue:"%s"}'
+              % (v, u, u), label)
+
+    # 需求入口从 mailto: 变成 URL 后，前端仍按「邮箱」口径渲染
+    # （按钮写「复制邮箱」、地址框标签写「联系邮箱」）。这里一并改成地址口径。
+    p.sub(re.escape(REQUEST_IS_MAIL), REQUEST_IS_URL, "作者信息·需求入口口径")
+
+    # 面板文案：去掉原作者署名（渠道有数）与「邮箱联系作者」的指引。
+    p.sub(re.escape(INTRO_OLD), INTRO_NEW, "作者信息·面板说明")
+    p.sub(re.escape(FOOTNOTE_OLD), FOOTNOTE_NEW, "作者信息·面板脚注")
+    p.sub(re.escape(NK_AUTHOR_OLD), NK_AUTHOR_NEW, "作者信息·关注入口文案")
 
     return p
 

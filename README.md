@@ -1,7 +1,10 @@
 # 红果桌面版 · 本地维护分支
 
-上游发行版 `waligoraamodio288-rgb/hongguo-desktop-releases`（红果短剧电脑版 / 红果桌面版）
-的本地二次维护。**上游每次发版后都能自动重新注入补丁**。
+红果短剧电脑版 / 红果桌面版（基线 **1.0.9**）的本地二次维护分支。
+发布与反馈入口：**https://github.com/dddmiku/hongguo-desktop-releases**
+
+本分支是上游安装包的**二次维护**，不依赖上游源码：直接对已安装的 exe 与后端
+重新注入补丁，**上游每次发版后都能自动重新注入**。
 
 当前基线：**1.0.9**（原版 exe sha256 `be60068affc6f6da…`）。
 
@@ -158,8 +161,9 @@ hls?series_id=7693487608646618174&ep=5&quality=1080p
 ## 验证与回滚
 
 ```powershell
-python tools/smoke_test.py           # 冒烟：语法 / import / 注入点 / 补丁链幂等（30 项）
+python tools/smoke_test.py           # 冒烟：语法 / import / 注入点 / 补丁链幂等（41 项）
 python tools/smoke_test.py --live    # 上面 + 安装目录一致性
+python tools/rebrand_exe.py <exe> --check   # 内嵌署名是否已换成本分支
 python verify/repro/pool_test.py     # 编码池：BASELINE vs MODIFIED
 python verify/repro/pool_three.py    # 三态：BASELINE / MODIFIED / ROLLBACK
 bash verify/ROLLBACK.sh --all <应用目录>   # 用内嵌基线还原后端
@@ -230,8 +234,28 @@ python tools/auto_patch.py uninstall # 取消自启动
 3. **直接从 exe 内嵌资源取出上游原版前端**（无需重新下载安装包）；
 4. 套用 `patches/patch_frontend.py`（版本无关，自动探测变量名）；
 5. 压回 exe 内嵌资源表；
-6. 套用 `patches/patch_backend.py` 到后端；
-7. 原子替换，并在 `_backup/` 留下原始备份。
+6. **重打署名**（`tools/rebrand_exe.py`）：把内嵌 `tauri.conf.json` 里的
+   `author` 段与更新端点换成本分支自己的仓库；
+7. 套用 `patches/patch_backend.py` 到后端；
+8. 原子替换，并在 `_backup/` 留下原始备份。
+
+### 署名重打标（为什么单独一步）
+
+上游的仓库 / 邮箱 / B 站地址写在**两处**，两处都要换：
+
+| 位置 | 形态 | 处理方式 |
+| --- | --- | --- |
+| 前端 `app.js` 的 `kR`/`MR`/`OR` | Brotli 压缩的内嵌资源 | `patches/patch_frontend.py` 第 16 步（跟着资源一起压回去） |
+| 内嵌 `tauri.conf.json` 的 `author` 段 + 更新端点 | 编译进 `.rdata` 的字符串字面量 | `tools/rebrand_exe.py` **等长原地覆盖** |
+
+第二处不能用资源那套改：它不是资源、也没有绝对指针引用，编译器把它当成
+`lea rax,[rip+disp]` + `mov qword [..], <长度立即数>`。长度是**编译期立即数**，
+所以字面量后面紧跟的字符串没有任何指针指向 —— **不能移动任何字节**。
+`rebrand_exe.py` 因此把新 JSON 用 CRLF 空行补齐到与原字节数**完全一致**再覆盖：
+长度立即数不用改，后面所有偏移不变，尾部空白是合法 JSON（原本就带一个尾随 CRLF）。
+
+`auto_patch apply` 每次都会调它，并且**前端标记全中也要单独判一次署名**
+（`is_rebranded()`）——否则上游发版后署名永远补不回来。
 
 > 应用运行时 exe 被占用，替换 exe 这一步会失败（后端此时已注入成功，
 > 下次会自动重试）。建议在软件内更新**并完全退出**后运行，
@@ -252,8 +276,10 @@ src/             补丁后的源码
 tools/           构建 / 校验 / 部署 / 自动重注入
   tauri_assets.py      PE 内嵌资源定位、解压、原地回写
   repack.py            把 src/frontend 压回 exe
+  rebrand_exe.py       内嵌 tauri.conf.json 署名等长重打标
   verify_repack.py     回读 exe 并与 src 比对
   auto_patch.py        更新后自动重新注入（含计划任务）
+  smoke_test.py        补丁链冒烟（41 项）
   deploy.ps1           部署到本机安装目录
   restore.ps1          还原为原始安装
 docs/architecture.md   逆向、打包与提速原理
