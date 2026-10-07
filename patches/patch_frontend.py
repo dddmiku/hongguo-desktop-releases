@@ -387,14 +387,28 @@ def patch(text):
           "键盘白名单")
 
     # ===== 14) 键盘快捷键分支（插在原有 "下一集" 分支之后，不碰收尾括号） =====
+    # 顺带加两处守卫（都是纯改进，不改行为语义）：
+    #   * 输入法组合中的按键不当作快捷键（isComposing），
+    #     否则在中文输入法下打字会误触发播放/跳转/静音。
+    #   * 自动重复（长按）不触发「切换类」动作。
+    #     注意：连续 seek（方向键）在上游本来就会随长按重复，
+    #     这里只挡 repeat，不改变单击行为。
+    p.sub(re.escape("ii=Le=>{Le.altKey||Le.ctrlKey||Le.metaKey||"),
+          "ii=Le=>{if(Le.isComposing)return;Le.altKey||Le.ctrlKey||Le.metaKey||",
+          "键盘输入法守卫")
     E, R, M, S, T, G = keyev, refs, media, seek, toggle, msg
     anchor = (E + '.key.toLowerCase()==="n"&&' + R + '.current.canNext&&!'
               + R + '.current.disabled&&' + R + '.current.onNext(),')
     if p.s.count(anchor) != 1:
         raise Fail(f"[FAIL] 键盘分支锚点命中 {p.s.count(anchor)} 次")
     extra = (
-        '(' + E + '.key==="["||' + E + '.key==="{")&&' + rate_set + '(hqStep(-1)),'
-        + '(' + E + '.key==="]"||' + E + '.key==="}")&&' + rate_set + '(hqStep(1)),'
+        # 长按（自动重复）不触发「切换类」动作：倍速、下一集、静音、循环、播放暂停。
+        # 否则按住 ] 会把倍速一路推到顶、按住 J 会连跳好几集。
+        # seek 类（方向键/翻页/数字）保持上游原有的随长按重复行为，不改。
+        '(' + E + '.key==="["||' + E + '.key==="{")&&!' + E + '.repeat&&'
+        + rate_set + '(hqStep(-1)),'
+        + '(' + E + '.key==="]"||' + E + '.key==="}")&&!' + E + '.repeat&&'
+        + rate_set + '(hqStep(1)),'
         + '(' + E + '.key==="<"||' + E + '.key===",")&&' + S
         + '(Math.max(0,(' + R + '.current.seekTarget??' + M + '.currentTime)-10)),'
         + '(' + E + '.key===">"||' + E + '.key===".")&&' + S
@@ -405,12 +419,12 @@ def patch(text):
         + '((' + R + '.current.seekTarget??' + M + '.currentTime)+60),'
         + E + '.key==="Home"&&' + S + '(0),'
         + E + '.key==="End"&&' + S + '(Number.isFinite(' + M + '.duration)?' + M + '.duration:0),'
-        + E + '.key.toLowerCase()==="k"&&' + T
+        + E + '.key.toLowerCase()==="k"&&!' + E + '.repeat&&' + T
         + '({inputSource:"keyboard",inputTrusted:' + E + '.isTrusted}),'
-        + E + '.key.toLowerCase()==="j"&&' + R + '.current.canNext&&!'
+        + E + '.key.toLowerCase()==="j"&&!' + E + '.repeat&&' + R + '.current.canNext&&!'
         + R + '.current.disabled&&' + R + '.current.onNext(),'
-        + E + '.key.toLowerCase()==="d"&&(' + M + '.muted=!' + M + '.muted),'
-        + E + '.key.toLowerCase()==="s"&&(' + M + '.loop=!' + M + '.loop,'
+        + E + '.key.toLowerCase()==="d"&&!' + E + '.repeat&&(' + M + '.muted=!' + M + '.muted),'
+        + E + '.key.toLowerCase()==="s"&&!' + E + '.repeat&&(' + M + '.loop=!' + M + '.loop,'
         + G + '(' + M + '.loop?"循环播放已开启":"循环播放已关闭")),'
         + '/^[0-9]$/.test(' + E + '.key)&&Number.isFinite(' + M + '.duration)&&'
         + M + '.duration>0&&' + S + '(' + M + '.duration*(Number(' + E + '.key)/10)),'
