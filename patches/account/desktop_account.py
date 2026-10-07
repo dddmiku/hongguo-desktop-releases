@@ -215,6 +215,7 @@ SMS_TYPE = os.environ.get("HONGGUO_SMS_TYPE", "24")   # 抓包: type=24 → 登�
 
 _lock = threading.RLock()
 _cache = None
+_cache_mtime = 0.0   # 缓存对应的会话文件 mtime（外部改写后要能失效重读）
 
 # ---- 诊断日志 -------------------------------------------------------------
 # 登录失败时用户没有可查的证据，所以每次护照调用都留一条记录。
@@ -300,10 +301,26 @@ def _gzip_body(payload):
 
 
 # ---- 登录态读写 -----------------------------------------------------------
+def _session_mtime():
+    try:
+        return os.path.getmtime(SESSION_PATH)
+    except OSError:
+        return 0.0
+
+
 def load_session():
-    global _cache
+    """读登录态。
+
+    带 mtime 失效检查：会话文件同时也被开发脚本/其它工具改写
+    （安装目录里就有直接 copy 覆盖它的脚本），
+    而 _cache 是模块级全局且原先只看一次文件 ——
+    外部改写后运行中的后端仍返回旧值，两边会互相覆盖。
+    这里只要文件比缓存新就重读。
+    """
+    global _cache, _cache_mtime
     with _lock:
-        if _cache is not None:
+        stamp = _session_mtime()
+        if _cache is not None and stamp == _cache_mtime:
             return _cache
         data = {}
         try:
@@ -314,11 +331,12 @@ def load_session():
         if not isinstance(data, dict):
             data = {}
         _cache = data
+        _cache_mtime = stamp
         return _cache
 
 
 def save_session(data):
-    global _cache
+    global _cache, _cache_mtime
     with _lock:
         _cache = data or {}
         try:
@@ -329,7 +347,19 @@ def save_session(data):
             os.replace(tmp, SESSION_PATH)
         except OSError:
             pass
+        _cache_mtime = _session_mtime()
     return _cache
+
+
+def _backup_path(uid=""):
+    """按账号分文件存「退出前的登录态」。
+
+    原先只有单槽位 .last，换号后一退出就把上一个号的备份覆盖掉了；
+    而恢复时不校验有效性，于是「恢复上次登录」可能恢复成另一个号，
+    或者恢复一个早就失效的会话。
+    """
+    text = re.sub(r"[^0-9A-Za-z_-]", "", str(uid or ""))[:40]
+    return SESSION_PATH + ".last" + ("." + text if text else "")
 
 
 def clear_session():
@@ -337,37 +367,87 @@ def clear_session():
 
     验证码登录尚未稳定，万一退出后登不回来，用户不该被卡死；
     所以这里把当前登录态另存一份，restore_session() 可以原样恢复。
+    备份按 uid 分文件，换号不会互相覆盖。
     """
     current = load_session() or {}
     if current.get("token") or current.get("cookie"):
-        try:
-            io.open(SESSION_PATH + ".last", "w", encoding="utf-8").write(
-                json.dumps(current, ensure_ascii=False, indent=2))
-        except OSError:
-            pass
+        for path in (_backup_path(current.get("uid")), SESSION_PATH + ".last"):
+            try:
+                io.open(path, "w", encoding="utf-8").write(
+                    json.dumps(current, ensure_ascii=False, indent=2))
+            except OSError:
+                pass
     return save_session({})
 
 
-def restore_session():
-    """把上一次「退出登录」前的登录态恢复回来。"""
+def _restore_candidates():
+    """可恢复的备份，当前账号优先，其次旧的单槽位 .last。"""
+    uid = (load_session() or {}).get("uid")
+    out = []
+    for path in (_backup_path(uid), SESSION_PATH + ".last"):
+        if path not in out:
+            out.append(path)
     try:
-        data = json.loads(io.open(SESSION_PATH + ".last", encoding="utf-8").read())
+        import glob as _g
+        for path in sorted(_g.glob(SESSION_PATH + ".last.*"), reverse=True):
+            if path not in out:
+                out.append(path)
     except Exception:
+        pass
+    return out
+
+
+def restore_session():
+    """把上一次「退出登录」前的登录态恢复回来。
+
+    恢复后必须验一次有效性：备份可能是失效会话，
+    直接写回会让界面显示「已登录」但所有请求都失败。
+    验证不通过就原样回滚，不污染当前登录态。
+    """
+    data = None
+    for path in _restore_candidates():
+        try:
+            cand = json.loads(io.open(path, encoding="utf-8").read())
+        except Exception:
+            continue
+        if isinstance(cand, dict) and (cand.get("token") or cand.get("cookie")):
+            data = cand
+            break
+    if data is None:
         return {"ok": False, "error": "没有可恢复的登录态"}
-    if not (isinstance(data, dict) and (data.get("token") or data.get("cookie"))):
-        return {"ok": False, "error": "备份里没有有效登录态"}
+    previous = load_session() or {}
+    # 校验要发网络请求，签名服务/网络不可用时会抛异常。
+    # 必须兜住：恢复登录态失败不该变成 500，更不能因此写回坏会话。
+    try:
+        info = _json(_call("GET", "/reading/user/info/v", session=data))
+    except Exception as exc:
+        log_event("restore_session", ok=False, reason="verify_error",
+                  error="%s" % type(exc).__name__)
+        return {"ok": False,
+                "error": "无法校验备份的登录态（%s），请稍后重试或用验证码登录"
+                         % type(exc).__name__}
+    body = info.get("data") if isinstance(info.get("data"), dict) else {}
+    if info.get("code") not in (0, "0") or not body:
+        log_event("restore_session", ok=False, code=info.get("code"),
+                  reason="backup_invalid")
+        return {"ok": False, "error": "备份的登录态已失效，请重新用验证码登录"}
+    data["user_name"] = body.get("user_name") or data.get("user_name") or ""
+    data["uid"] = str(body.get("user_id") or data.get("uid") or "")
     save_session(data)
-    log_event("restore_session", ok=True)
+    log_event("restore_session", ok=True, user=bool(data["user_name"]))
     return {"ok": True, "session": public_session(data)}
 
 
 def has_restorable():
     """是否存在可恢复的登录态（用于前端显示恢复入口）。"""
-    try:
-        data = json.loads(io.open(SESSION_PATH + ".last", encoding="utf-8").read())
-        return bool(isinstance(data, dict) and (data.get("token") or data.get("cookie")))
-    except Exception:
-        return False
+    for path in _restore_candidates():
+        try:
+            data = json.loads(io.open(path, encoding="utf-8").read())
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("token") or data.get("cookie")):
+            return True
+    return False
 
 
 def is_logged_in():
@@ -902,14 +982,17 @@ def sync_from_emulator():
     if not (token or cookie):
         return {"ok": False, "error": "模拟器里没有可用的登录态；请先在模拟器里登录一次"}
 
-    session = load_session() or {}
+    # 先在内存里构造并验证，通过之后才落盘。
+    # 之前是「先 save_session 再验」，验证失败也不回滚 ——
+    # 于是模拟器里抓到的坏凭据会覆盖掉原本可用的登录态。
+    # 也不再用 load_session() 做基底：失败时不能污染既有会话。
+    session = {}
     if token:
         session["token"] = token
     if cookie:
         session["cookie"] = cookie
     session["saved_at"] = int(time.time())
     session["source"] = "emulator"
-    save_session(session)
 
     # 立刻验一次，确认真的能用
     info = _json(_call("GET", "/reading/user/info/v", session=session))

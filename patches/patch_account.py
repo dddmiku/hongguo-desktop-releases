@@ -52,10 +52,15 @@ let ids=[];
 try{const h=await T.invoke("list_history");if(Array.isArray(h))ids=ids.concat(h.map(function(x){return String(x.seriesId)}))}catch(e){}
 try{const f=await T.invoke("list_favorites");if(Array.isArray(f))ids=ids.concat(f.map(function(x){return String(x.seriesId)}))}catch(e){}
 if(!ids.length){
-for(const cmd of (["get_rank","get_recommendations","get_new_releases"])){
+// 每个 Tauri 命令都有自己的必填键，不能统一传 {kind:"hot"}。
+// 之前三个命令的参数全错（CDP 实测报 missing required key rankType /
+// tasteTags / genre），只是本机片单非空所以这条兜底从没被执行过。
+// get_new_releases 实测对 hot/real 都返回「不支持的新剧频道」，故不用它。
+for(const c of ([[ "get_rank",{rankType:"hot",refresh:!1,page:1}],
+                 [ "get_recommendations",{tasteTags:[]}]])){
 if(ids.length)break;
 try{
-const r=await T.invoke(cmd,{kind:"hot"});
+const r=await T.invoke(c[0],c[1]);
 const arr=r&&(r.items||r);if(Array.isArray(arr))ids=ids.concat(arr.map(function(x){return String(x&&x.seriesId||"")}))}
 catch(e){}}
 }
@@ -98,10 +103,13 @@ if(uid&&uid!==prev){
 try{localStorage.setItem("guoban:acctUid",uid)}catch(e){}
 const w=window.__hqLib;
 if(w&&w.setHist&&w.setFav){
-// 只丢「上一个账号带进来的」：本机自己的记录（没有 fromUid）保留。
+// 只丢「上一个账号从手机端带进来的」。
+// 判据必须用显式的 fromPhone，而不是「有没有 fromUid」：
+// 从 sqlite 重新载入的条目可能缺 fromUid（旧版本落盘时没写），
+// 用 !fromUid 判会把它误当「本机原有」而永久保留。
 const drop=function(list){return (list||[]).filter(function(x){
-if(!x||!x.fromUid)return !0;          // 本机原有，保留
-return String(x.fromUid)===uid})};   // 手机端来的，只留当前号的
+if(!x||x.fromPhone!==!0)return !0;    // 本机原有的，保留
+return String(x.fromUid||"")===uid})}; // 手机端来的，只留当前号的
 w.setHist(function(list){const n=drop(list);w.hist=n;return n});
 w.setFav(function(list){const n=drop(list);w.fav=n;return n});
 hqMergedOnce=!1;
@@ -131,6 +139,9 @@ signal:AbortSignal.timeout(4000)});return r.ok}catch(e){return!1}}
 // 多刷几次即全量收敛，且每轮界面增量可控。
 // 配合 hqPersistMerged 落盘，重启后已合并的部分不会重来。
 var HQ_PHONE_MAX=120, HQ_PHONE_STEP=40;
+// 本机「手机端来源」条目的总量上限。HQ_PHONE_MAX 只管单次并入多少，
+// 不封顶的话反复刷新会把整份云端历史搬进本机。
+var HQ_PHONE_TOTAL=300;
 function hqRemoteLibrary(){
 return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)}
 
@@ -167,10 +178,18 @@ episodeCount:Number(c.total)||x.episodeCount||0});raised++}}
 if(raised)setHist(histOut.slice());
 // 「取最新的一批」：先按 seen 过滤掉已有的，再排序截断。
 // seen 用合并后的 histOut（含本机 + 刚抬高的），否则下一轮会把同一条又拉一遍。
+//
+// 总量封顶：HQ_PHONE_MAX 只限制「单次」，而合并会被反复触发
+// （进历史页 / 切回前台 / 账号页连通），每轮再拉 120 条新的，
+// 最终会把整份云端历史（实测 574 条）全搬进本机。
+// 这里按「本机手机端来源条目总数」封顶，避免把片单撑爆。
+const phoneCount=histOut.filter(function(x){return x&&x.fromPhone===!0}).length;
+const room=Math.max(0,HQ_PHONE_TOTAL-phoneCount);
+if(room<=0)return {fav:favOut,hist:histOut};
 const seen=new Set(histOut.map(function(x){return String(x.seriesId)}));
 const extra=r.history.filter(function(h){return h&&h.seriesId&&!seen.has(String(h.seriesId))})
 .sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0)})
-.slice(0,HQ_PHONE_MAX)
+.slice(0,Math.min(HQ_PHONE_MAX,room))
 .map(function(h){return {seriesId:String(h.seriesId),title:h.title||"",cover:h.cover||"",
 tags:[],actors:[],intro:[],hotText:"",
 lastEpisode:Number(h.episode)||1,episodeCount:Number(h.total)||0,
@@ -195,19 +214,41 @@ if(hqPersisting)return 0;hqPersisting=!0;
 try{
 let local=[];
 try{const h=await T.invoke("list_history");if(Array.isArray(h))local=h}catch(e){}
-const have=new Set(local.map(function(x){return String(x.seriesId)}));
+const have={};
+local.forEach(function(x){have[String(x.seriesId)]=x});
 const cur=(merged&&merged.hist)||[];
-let added=0;
+let wrote=0;
 for(const x of cur){
-const id=String(x.seriesId||"");if(!id||have.has(id))continue;
-if(!/^\d{8,24}$/.test(id))continue;
+const id=String(x.seriesId||"");
+if(!id||!/^\d{8,24}$/.test(id))continue;
+const cur_ep=Number(x.lastEpisode)||1;
+const old=have[id];
+// 已存在的条目：只有进度更靠前时才回写。
+// 之前一律 continue，导致「手机端更靠前」的抬升只活在内存里，
+// 重启就回退成 sqlite 里的旧值。
+if(old){
+if(cur_ep<=(Number(old.lastEpisode)||0))continue;
 try{
+await T.invoke("add_history",{series:{seriesId:id,title:x.title||old.title||"",
+cover:x.cover||old.cover||"",intro:typeof x.intro==="string"?x.intro:(old.intro||""),
+tags:Array.isArray(x.tags)?x.tags:(old.tags||[]),
+actors:Array.isArray(x.actors)?x.actors:(old.actors||[]),
+episodeCount:Number(x.episodeCount)||Number(old.episodeCount)||0},
+lastEpisode:cur_ep});
+wrote++}catch(e){}
+continue}
+try{
+// 落盘时带上来源账号。丢掉它会让 hqOnAccount 的换号清理认不出这些条目
+// （它靠 fromUid 区分「本机原有」与「手机端带进来的」），
+// 重启后上个号的历史就永久留在本机了。
 await T.invoke("add_history",{series:{seriesId:id,title:x.title||"",
 cover:x.cover||"",intro:typeof x.intro==="string"?x.intro:"",
 tags:Array.isArray(x.tags)?x.tags:[],actors:Array.isArray(x.actors)?x.actors:[],
-episodeCount:Number(x.episodeCount)||0},lastEpisode:Number(x.lastEpisode)||1});
-have.add(id);added++}catch(e){}}
-return added;
+episodeCount:Number(x.episodeCount)||0,
+fromUid:x.fromUid||"",fromPhone:!!x.fromPhone},
+lastEpisode:cur_ep});
+have[id]={seriesId:id,lastEpisode:cur_ep};wrote++}catch(e){}}
+return wrote;
 }catch(e){return 0}finally{hqPersisting=!1}}
 
 // 合并入口。
@@ -311,7 +352,7 @@ v("验证码已发送，请查看手机短信。"),T("")}catch(e){v("发送失�
 async function R(){m(!0),v("");try{const x=await hqPost("/desktop/account/login",{mobile:o,code:d});
 if(x&&x.loggedIn){a(x),hqSaveStatus(x),f(""),hqSetTryAt(0),v("登录成功，观看进度与收藏会同步到手机。"),T("")}
 else{v("登录失败：响应异常"),T("error")}}
-catch(e){const raw=hqErr(e);hqSetTryAt(30);v("登录失败："+hqHint(raw)),T("error")}
+catch(e){const raw=hqErr(e);hqSetTryAt(120);v("登录失败："+hqHint(raw)),T("error")}
 finally{m(!1)}}
 async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/logout",null,"POST",null);
 a(x||{loggedIn:!1}),hqDropStatus(),v("已退出账号同步。"),T("")}finally{m(!1)}}
@@ -340,7 +381,12 @@ onChange:x=>f(x.target.value.replace(/\D/g,"").slice(0,8))})]}),
 JSX.jsxs("div",{className:"hq-acct-actions",children:[
 JSX.jsx("button",{className:"secondary",onClick:()=>void L(),
 disabled:g||o.length!==11||hqCd>0,children:hqCd>0?("重新发送（"+hqCd+"s）"):"发送验证码"}),
-JSX.jsx("button",{className:"primary",onClick:()=>void R(),disabled:g||o.length!==11||d.length<4,
+// 冷却必须真的禁用按钮。之前 hqTryAt 只写进了按钮文案，
+// disabled 里没有它 —— 连点就会连续失败，把风控从「访问太频繁」
+// 升级到「为保证账号安全，暂不支持此操作」(2046)。
+// 实测 account-log.jsonl：39 次失败里有 6 次相邻间隔 < 10 秒。
+JSX.jsx("button",{className:"primary",onClick:()=>void R(),
+disabled:g||o.length!==11||d.length<4||hqTryAt>0,
 children:g?"处理中…":(hqTryAt>0?("请稍候（"+hqTryAt+"s）"):"登录")})]})]}),
 p?JSX.jsx("p",{className:"hq-acct-note"+(E?" error":""),role:"status",children:p}):null]})}
 """

@@ -149,20 +149,28 @@ PREFETCH_LOOP_NEW = (
     '}'
 )
 
-# 清理：只清超过当前+2 的，保留下一集的预取
+# 清理：只保留「下一集 / 下下集」，其余一律释放。
+# 之前只清「大于当前+2」的，于是用户往回跳或跨集远跳时，
+# key 落在 [1, 新ep+2] 的旧预取既不被消费也不被释放 ——
+# 每个悬空会话在后端占一个编码池槽位（max_jobs=8），
+# 要等 240s 自动释放才还回去。
 PREFETCH_CLEAN_OLD = (
     "tt&&et.current?.preparation===tt&&(et.current=null,tt.dispose())"
 )
 PREFETCH_CLEAN_NEW = (
-    "et.current.forEach((Vt,hs)=>{if(hs>C.episode+2){Vt.preparation.dispose(),et.current.delete(hs)}})"
+    "et.current.forEach((Vt,hs)=>{"
+    "if(hs!==C.episode+1&&hs!==C.episode+2){Vt.preparation.dispose(),et.current.delete(hs)}})"
 )
 
-# 消费点：从 Map 取对应集的预取
+# 消费点：从 Map 取对应集的预取，并顺手 prune 掉「不再需要」的条目
+# （往回跳/远跳时旧的预取不会被消费，必须在这里释放）。
 PREFETCH_USE_OLD = (
     "const Fe=et.current?.session.episode===ae?et.current:null;"
     "Fe||et.current?.preparation.dispose(),Fe||(et.current=null),Fe&&(et.current=null),"
 )
 PREFETCH_USE_NEW = (
+    "et.current.forEach((Vt,hs)=>{"
+    "if(hs!==ae&&hs!==ae+1&&hs!==ae+2){Vt.preparation.dispose(),et.current.delete(hs)}});"
     "const Fe=et.current.get(ae)??null;Fe&&et.current.delete(ae),"
 )
 
