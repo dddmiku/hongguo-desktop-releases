@@ -257,10 +257,18 @@ def stats(request: Request):
             "download_tasks": len(H.manager().status())}
 
 
+def _hq_static_page(name):
+    """读 backend/web/<name>；打包版没有这个目录，缺就 404 而不是 500。"""
+    from fastapi.responses import FileResponse
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "该页面未包含在当前安装包中")
+    return FileResponse(path)
+
+
 @app.get("/ui")
 def ui():
-    from fastapi.responses import FileResponse
-    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "index.html"))
+    return _hq_static_page("index.html")
 
 
 def _hq_host_allowed(host, hosts):
@@ -334,8 +342,7 @@ def _mask(k: str) -> str:
 
 @app.get("/admin")
 def admin_page():
-    from fastapi.responses import FileResponse
-    return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "admin.html"))
+    return _hq_static_page("admin.html")
 
 
 @app.get("/admin/keys")
@@ -651,49 +658,9 @@ if __name__ == "__main__":
 
 
 # ---- 本地维护: 看过的集自动清理缓存 ----
-def _hq_sweep_stale_sessions(root=None, keep=1):
-    """清扫上次运行遗留的 HLS 工作目录。
-
-    2026-10-07 实测：应用数据目录里积了 31 个 desktop-hls-* 目录，
-    其中 6 个残留合计 1.89 GB。设计上由 Rust 父进程在退出时删除，
-    但后端被强杀/崩溃时不会执行，目录就永久留下了。
-    这里在启动时清一次：只删「工作根目录下的 UUID 子目录」，保留最新的一个。
-
-    注意：必须定义在 server.py 的模块级调用之前，
-    否则会 NameError（2026-10-07 踩过，后端直接起不来）。
-    """
-    import re as _re
-    import shutil as _sh
-    root = root or os.environ.get("HONGGUO_HLS_WORK_DIR") or ""
-    if not root or not os.path.isdir(root):
-        return 0
-    root = os.path.abspath(root)
-    try:
-        entries = []
-        for name in os.listdir(root):
-            full = os.path.join(root, name)
-            if not os.path.isdir(full) or os.path.islink(full):
-                continue
-            # 只认 UUID 形态的子目录，绝不碰其他内容。
-            if not _re.fullmatch(r"[0-9a-fA-F-]{8,64}", name):
-                continue
-            try:
-                entries.append((os.path.getmtime(full), full))
-            except OSError:
-                pass
-        entries.sort(reverse=True)
-        removed = 0
-        for _, full in entries[keep:]:
-            try:
-                if os.path.dirname(os.path.abspath(full)) != root:
-                    continue
-                _sh.rmtree(full)
-                removed += 1
-            except OSError:
-                pass
-        return removed
-    except Exception:
-        return 0
+# 注意：启动清扫 HLS 残留目录的逻辑内联在调用点（见 patch_server 的「启动清扫」步骤），
+# 不在这里定义函数 —— 这里在文件末尾，定义在后、调用在前会 NameError。
+# 曾经留过一个同名的 _hq_sweep_stale_sessions 定义但从未被调用（死代码），已删除。
 
 
 def _hq_cleanup_episode(series_id, episode):
