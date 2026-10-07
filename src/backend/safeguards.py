@@ -6,6 +6,8 @@ import time, threading, hashlib, json, random
 import os, pickle
 _cache = {}
 _cache_lock = threading.Lock()
+# 本地维护: 内存缓存的条目上限（Redis 模式不受影响）。
+_HQ_SAFEGUARDS_CACHE_MAX = 2048
 _redis = None
 _REDIS_URL = os.environ.get("REDIS_URL")
 if _REDIS_URL:
@@ -44,6 +46,11 @@ def cache_set(key, val, ttl):
         return
     with _cache_lock:
         _cache[key] = (time.time() + ttl, val)
+        # 本地维护: 加数量上限。原实现只在 get 命中时清过期项，
+        # 写入后没人再读的 key 会永远留着（桌面端长跑会累积）。
+        if len(_cache) > _HQ_SAFEGUARDS_CACHE_MAX:
+            for _k in sorted(_cache, key=lambda k: _cache[k][0])[:len(_cache) - _HQ_SAFEGUARDS_CACHE_MAX]:
+                _cache.pop(_k, None)
 
 
 def cache_key(*parts):

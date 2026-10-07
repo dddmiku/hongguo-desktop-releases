@@ -998,6 +998,43 @@ def patch_downloader(src_dir, out_dir):
     print("OK   downloader.py  (%d 处 verify=False -> True)" % n)
 
 
+# ---- 本地维护: safeguards 的内存缓存加上限 ----
+# _cache 只在 cache_get 命中时顺带清过期项：写入频率高于读取、
+# 或写进去之后没人再读的 key 会永远留着。桌面端长跑（挂着不关）
+# 会慢慢累积。这里在 cache_set 时按数量上限淘汰最旧的一批。
+SAFEGUARDS_CACHE_BAD = '''    with _cache_lock:
+        _cache[key] = (time.time() + ttl, val)'''
+SAFEGUARDS_CACHE_OK = '''    with _cache_lock:
+        _cache[key] = (time.time() + ttl, val)
+        # 本地维护: 加数量上限。原实现只在 get 命中时清过期项，
+        # 写入后没人再读的 key 会永远留着（桌面端长跑会累积）。
+        if len(_cache) > _HQ_SAFEGUARDS_CACHE_MAX:
+            for _k in sorted(_cache, key=lambda k: _cache[k][0])[:len(_cache) - _HQ_SAFEGUARDS_CACHE_MAX]:
+                _cache.pop(_k, None)'''
+
+
+def patch_safeguards(src_dir, out_dir):
+    name = "safeguards.py"
+    p_in = os.path.join(src_dir, name)
+    p_out = os.path.join(out_dir, name)
+    if not os.path.isfile(p_in):
+        return
+    s = io.open(p_in, encoding="utf-8").read()
+    if "_HQ_SAFEGUARDS_CACHE_MAX" in s:
+        io.open(p_out, "w", encoding="utf-8", newline="").write(s)
+        print("OK   safeguards.py 已处理（跳过）")
+        return
+    s = sub_once(s, re.escape("_cache = {}\n_cache_lock = threading.Lock()"),
+                 "_cache = {}\n_cache_lock = threading.Lock()\n"
+                 "# 本地维护: 内存缓存的条目上限（Redis 模式不受影响）。\n"
+                 "_HQ_SAFEGUARDS_CACHE_MAX = 2048",
+                 "safeguards 缓存上限常量")
+    s = sub_once(s, re.escape(SAFEGUARDS_CACHE_BAD), SAFEGUARDS_CACHE_OK,
+                 "safeguards 缓存上限应用")
+    io.open(p_out, "w", encoding="utf-8", newline="").write(s)
+    print("OK   safeguards.py  (内存缓存加上限)")
+
+
 def patch_requirements(src_dir, out_dir):
     """把依赖文件固定到已验证的版本。"""
     name = "requirements-windows.txt"
@@ -1022,6 +1059,7 @@ def main():
     patch_server(src, dst)
     patch_encode(src, dst)
     patch_downloader(src, dst)
+    patch_safeguards(src, dst)
     patch_account_backend(src, dst)
     patch_requirements(src, dst)
 

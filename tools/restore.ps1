@@ -3,7 +3,7 @@ $root = "d:\Users\dddmiku\AppData\Local\红果免费短剧"
 $bak  = "C:\Users\dddmiku\Desktop\codex\hongguo-desktop-maintain\_backup\orig"
 $files = @("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
            "desktop_account.py", "desktop_account_api.py", "downloader.py",
-           "requirements-windows.txt")
+           "safeguards.py", "requirements-windows.txt")
 # 上游基线里没有、由我们新增的文件。还原时要删掉，否则会残留账号模块，
 # server.py 还原后还会 import 它们（原版没有这段，但文件留着是隐患）。
 $added = @("desktop_account.py", "desktop_account_api.py")

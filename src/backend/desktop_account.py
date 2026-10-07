@@ -688,12 +688,27 @@ def sms_login(mobile, code):
     return {"ok": True, "code": 0, "session": public_session(session)}
 
 
+def _mask_uid(value):
+    """把 uid 变成「同一账号稳定、但看不出原文」的短标识。
+
+    红果的 uid 形如 `#c1967_<base64>`，base64 解开就是明文 user_id
+    （实测 `MTk2NzE5...` -> `19671967196719676...`）。
+    mobile 已经脱敏，uid 却原样返回给前端并写进 localStorage，口径不一致。
+    这里用 sha256 前 16 位代替：仍然唯一、仍然稳定（前端靠它做换号隔离），
+    但不再携带明文 user_id。
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    return "u" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def public_session(session=None):
     s = session if session is not None else load_session()
     return {
         "loggedIn": bool(s.get("cookie") or s.get("token")),
         "userName": s.get("user_name") or "",
-        "uid": s.get("uid") or "",
+        "uid": _mask_uid(s.get("uid")),
         "mobile": (s.get("mobile") or "")[:3] + "****" + (s.get("mobile") or "")[-4:]
         if s.get("mobile") else "",
         "savedAt": s.get("saved_at") or 0,

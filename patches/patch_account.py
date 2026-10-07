@@ -191,7 +191,7 @@ const extra=r.history.filter(function(h){return h&&h.seriesId&&!seen.has(String(
 .sort(function(a,b){return (Number(b.updatedAt)||0)-(Number(a.updatedAt)||0)})
 .slice(0,Math.min(HQ_PHONE_MAX,room))
 .map(function(h){return {seriesId:String(h.seriesId),title:h.title||"",cover:h.cover||"",
-tags:[],actors:[],intro:[],hotText:"",
+tags:[],actors:[],intro:"",hotText:"",
 lastEpisode:Number(h.episode)||1,episodeCount:Number(h.total)||0,
 fromPhone:!0,fromUid:uid}});
 // 分批追加：每批 HQ_PHONE_STEP 条，让界面能喘口气。

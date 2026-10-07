@@ -7,7 +7,7 @@ $work = "C:\Users\dddmiku\Desktop\codex\hongguo-desktop-maintain"
 # 不同步就会出现「源码与安装目录不一致」。
 $files = @("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
            "desktop_account.py", "desktop_account_api.py", "downloader.py",
-           "requirements-windows.txt")
+           "safeguards.py", "requirements-windows.txt")
 
 Get-Process hongguo-desktop-companion -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 4

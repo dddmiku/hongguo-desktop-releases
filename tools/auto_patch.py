@@ -44,9 +44,11 @@ TASK = "HongguoDesktopPatch"
 
 # 补丁涉及的全部后端文件；部署与备份都必须覆盖它们，缺一个就会「媒体准备失败」。
 PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "desktop_encode.py",
-                 "desktop_account.py", "desktop_account_api.py")
+                 "desktop_account.py", "desktop_account_api.py", "downloader.py", "safeguards.py")
 
 # 我们新增、上游基线里没有的模块（从 patches/account/ 重建）。
+# 注意：safeguards.py 是上游自带文件（只是被补丁改过），不能列在这里 ——
+# 列进来会让 auto_patch 从 patches/account/ 找它，找不到就跳过，等于漏打补丁。
 ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py")
 
 
@@ -115,6 +117,8 @@ FULL_MARKERS = {
     "desktop_encode.py": ("cancelled is not None and cancelled()",),
     "desktop_account.py": ("def sms_login",),
     "desktop_account_api.py": ("def register",),
+    "safeguards.py": ("_HQ_SAFEGUARDS_CACHE_MAX",),
+    "downloader.py": ("verify=True",),
 }
 
 
@@ -158,6 +162,8 @@ def patch_live_backend(backend):
         "desktop_encode.py": ("cancelled is not None and cancelled()",),
         "desktop_account.py": ("def sms_login",),
         "desktop_account_api.py": ("def register",),
+        "downloader.py": ("verify=True",),
+        "safeguards.py": ("_HQ_SAFEGUARDS_CACHE_MAX",),
     }
 
     patched, skipped, failed = [], [], []
@@ -198,6 +204,10 @@ def patch_live_backend(backend):
                 patch_backend.patch_server(staging, staging)
             elif name == "desktop_encode.py":
                 patch_backend.patch_encode(staging, staging)
+            elif name == "downloader.py":
+                patch_backend.patch_downloader(staging, staging)
+            elif name == "safeguards.py":
+                patch_backend.patch_safeguards(staging, staging)
         except SystemExit as exc:
             failed.append((name, str(exc)))
             continue
@@ -221,6 +231,11 @@ def patch_live_backend(backend):
     # 这里补上：从 patches/account/ 重建，并在 server.py 末尾注册路由（幂等）。
     try:
         acct_patched = _patch_account_modules(backend)
+        # 逐文件循环会把「内容一致所以跳过」记进 skipped；这里重建时可能又写了一遍，
+        # 同一个文件不能同时出现在两个列表里，否则日志自相矛盾。
+        for name in acct_patched:
+            if name in skipped:
+                skipped.remove(name)
         patched.extend(acct_patched)
     except SystemExit as exc:
         failed.append(("desktop_account*.py", str(exc)))
