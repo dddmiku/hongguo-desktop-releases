@@ -447,16 +447,34 @@ var HQ_PHONE_MAX=120, HQ_PHONE_STEP=40;
 // 本机「手机端来源」条目的总量上限。HQ_PHONE_MAX 只管单次并入多少，
 // 不封顶的话反复刷新会把整份云端历史搬进本机。
 var HQ_PHONE_TOTAL=300;
-function hqRemoteLibrary(){
-return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)}
+// 云端历史结果缓存。
+// 每次进历史页 / 切回前台都会触发刷新，而拉一次 200 条实测要 3.4 秒
+// （服务端返回 497 条 + 本地解密链路），所以「每次打开都要等很久」。
+// 这里缓存上一次结果：
+//   * TTL 内直接复用，不再打网络 —— 界面立刻出内容；
+//   * 即使过期也先返回旧数据（stale-while-revalidate），再后台刷新，
+//     这样打开历史页永远是「秒开」，只是内容稍后补齐。
+var HQ_REMOTE_TTL=120000;
+var hqRemoteCache={at:0,data:null,uid:""};
+function hqRemoteLibrary(force){
+var now=Date.now(),uid=hqCachedUid();
+// 换号后缓存必须作废，否则会拿上一个号的历史去合并。
+if(hqRemoteCache.uid!==uid){hqRemoteCache={at:0,data:null,uid:uid}}
+if(!force&&hqRemoteCache.data&&now-hqRemoteCache.at<HQ_REMOTE_TTL){
+return Promise.resolve(hqRemoteCache.data)}
+var stale=hqRemoteCache.data;
+return hqAcctCall("/desktop/account/remote",{limit:"200"},"GET",null)
+.then(function(r){
+if(r){hqRemoteCache={at:Date.now(),data:r,uid:hqCachedUid()}}
+return r||stale}).catch(function(){return stale||null})}
 
 // 合并后的最终片单。
 // 不再依赖 React 的 setState 回调去读结果：__hqLib.hist 是上游加载时的
 // 合并前快照，拿它做落盘会一条都写不进去（2026-07-07 复核发现）。
 // 这里在纯 JS 里算出最终数组，返回给调用方，落盘与 UI 用同一份数据。
-async function hqMergeLibrary(localFav,localHist,setFav,setHist){
+async function hqMergeLibrary(localFav,localHist,setFav,setHist,force){
 try{
-const r=await hqRemoteLibrary();if(!r)return null;
+const r=await hqRemoteLibrary(force);if(!r)return null;
 const uid=hqCachedUid();
 const favOut=(localFav||[]).slice();
 const histOut=(localHist||[]).slice();
@@ -578,7 +596,7 @@ return hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist).then(function(m){
 void hqPersistMerged(m)})}
 // 强制刷新（忽略一次性标志），用于进入历史页 / 切回前台。
 var hqRefreshing=!1;
-async function hqRefreshLibrary(){
+async function hqRefreshLibrary(force){
 const w=window.__hqLib;if(!w||!w.setFav||!w.setHist)return;
 if(hqRefreshing)return;hqRefreshing=!0;
 try{
@@ -589,7 +607,14 @@ if(!hqApi())await hqEnsureApi();
 if(!(await hqApiAlive())){hqForgetApi();
 if(!(await hqEnsureApi()))return;
 if(!(await hqApiAlive()))return}
-const merged=await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist);
+// 先用缓存立刻渲染一次（打开历史页不再等 3.4 秒），
+// 再按 TTL 决定要不要后台刷新。
+if(hqRemoteCache.data){
+try{const quick=await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist);
+if(quick)hqPersistMerged(quick)}catch(e){}}
+if(!force&&hqRemoteCache.data&&Date.now()-hqRemoteCache.at<HQ_REMOTE_TTL){
+hqMergedOnce=!0;return}
+const merged=await hqMergeLibrary(w.fav||[],w.hist||[],w.setFav,w.setHist,true);
 hqMergedOnce=!0;
 void hqPersistMerged(merged);
 }catch(e){}finally{hqRefreshing=!1}}

@@ -818,10 +818,13 @@ _HISTORY_PAGE_MAX = 20        # 最多 4000 条，防跑飞
 def _history_all(max_items=2000):
     """翻页取云端历史，返回 (items, total, ok, error)。
 
-    为什么必须翻页：只读第一页的话，排在后面的条目会被当成「云端没有」，
-    于是 remote_progress 会把它们判成进度 0 —— 合并逻辑随后可能用本地
-    较低的进度把它覆盖掉。这对历史很长的账号是真问题（实测 574 条里
-    有 77 条落在第一页之外）。
+    只在**需要看全量**的场合用（例如查某部剧的云端进度 —— 只读第一页的话，
+    排在后面的剧会被当成「云端没有」，progress 判成 0，
+    合并逻辑随后可能用本地较低的进度把它覆盖掉。实测 574 条里有 77 条
+    落在第一页之外）。
+
+    注意：翻页 = 多一次往返（实测单次 3.4 秒），
+    给界面用的列表**不要**走这里，用 _history_page()。
     """
     items = []
     seen = set()
@@ -866,6 +869,26 @@ def _history_all(max_items=2000):
     return items, total, last["ok"], last.get("error", "")
 
 
+def _history_page(limit=200):
+    """只取第一页（服务端已按「最近观看」降序返回）。
+
+    给界面列表用：一次往返即可，且最新的条目一定在第一页。
+    翻页留给 remote_progress 那种「必须确认某条在不在」的场合。
+    """
+    try:
+        r = _call("GET", "/reading/bookapi/read_history/list/v", extra={
+            "book_type": "2", "offset": "0", "limit": str(int(limit)),
+            "query_soft_deleted": "false", "is_first_load": "false",
+            "last_min_read_timestamp_ms": "0", "full_field": "false"})
+        j = _json(r)
+    except Exception as exc:
+        return [], 0, False, "%s" % type(exc).__name__
+    if j.get("code") not in (0, "0"):
+        return [], 0, False, j.get("message") or "读取失败"
+    data = j.get("data") or {}
+    return (data.get("data_list") or [], int(data.get("total") or 0), True, "")
+
+
 def remote_progress(series_id):
     """查单部剧在云端的进度（用于「取最新」合并，避免把进度改小）。
 
@@ -892,7 +915,9 @@ def remote_progress(series_id):
 def remote_history(limit=30):
     if not is_logged_in():
         return {"ok": False, "error": "未登录红果账号"}
-    raw, total, ok, error = _history_all(max_items=max(1, int(limit)))
+    # 界面列表只需第一页：服务端已按「最近观看」降序返回，
+    # 最新的条目一定在第一页。翻页留给 remote_progress（要确认某条在不在）。
+    raw, total, ok, error = _history_page(limit=max(1, int(limit)))
     if not ok:
         return {"ok": False, "error": error or "读取失败"}
     items = []
