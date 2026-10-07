@@ -248,6 +248,48 @@ def test_bind_scope():
     check("默认绑定 127.0.0.1", host == "127.0.0.1", "实际默认=%s" % host)
 
 
+def test_auto_patch_ready():
+    """自动重新注入的前置条件必须成立（否则上游发版后补丁会永久停在旧版）。
+
+    2026-10-07 实测：apply 这条路其实走不通，三处阻塞：
+      a) is_patched 只查 hqQuals -> 任何旧补丁版都算「已打补丁」，永不升级；
+      b) 前端补丁探针假定输入是未打补丁的 js -> 对旧补丁版直接失败；
+      c) apply 没加载 blobcaps 容量记录 -> 压缩后超容量直接报错。
+    这里把 a 和 c 变成断言。
+    """
+    section("6b. 自动重新注入的前置条件")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "auto_patch", os.path.join(ROOT, "tools", "auto_patch.py"))
+    if spec is None:
+        check("跳过：找不到 auto_patch.py", True)
+        return
+    ap = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(ap)
+    except Exception as e:
+        check("auto_patch 可导入", False, "%s: %s" % (type(e).__name__, e))
+        return
+    check("auto_patch 可导入", True)
+    # a) 判据必须能区分「旧补丁版」与「当前补丁版」
+    marks = getattr(ap, "EXE_FULL_MARKERS", ())
+    check("已打补丁判据不止一个标记", len(marks) >= 5, "标记数=%d" % len(marks))
+    body = io.open(os.path.join(FRONTEND, "app.js"), encoding="utf-8").read()
+    missing = [m.decode() for m in marks if m.decode() not in body]
+    check("当前前端含全部补丁标记", not missing,
+          "" if not missing else "缺: " + ", ".join(missing))
+    # b) 兜底：exe 内嵌前端已是旧补丁时，必须有可用的上游原版
+    base_js = os.path.join(ROOT, "base", "frontend", "app.js")
+    ok_base = os.path.isfile(base_js) and "hqQuals" not in io.open(
+        base_js, encoding="utf-8").read()
+    check("base/frontend 是未打补丁的上游原版（重新注入的输入）", ok_base)
+    # c) apply 必须加载容量记录，否则压缩超容量
+    src = io.open(os.path.join(ROOT, "tools", "auto_patch.py"), encoding="utf-8").read()
+    check("apply 加载 blobcaps 容量记录", "load_capacities(EXE)" in src)
+    check("apply 会写回新容量", "save_capacities(tmp_exe" in src)
+    check("apply 也套账号补丁", "patch_account.patch" in src)
+
+
 def test_live():
     section("7. 安装目录一致性")
     if not os.path.isdir(LIVE):
@@ -271,6 +313,7 @@ def main():
     test_frontend_syntax()
     test_markers()
     test_patch_idempotency()
+    test_auto_patch_ready()
     test_routes()
     test_bind_scope()
     if "--live" in sys.argv:
