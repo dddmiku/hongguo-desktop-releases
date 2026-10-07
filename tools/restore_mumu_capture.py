@@ -25,18 +25,36 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ADB = os.environ.get("ADB", r"D:\Tools\adb\adb.exe")
-# MuMu 12 的 adb 端口：16448 是常用值，7555 是备用
-CANDIDATES = ["127.0.0.1:16448", "127.0.0.1:7555"]
+# MuMu 12 的 adb 端口：16384 是当前实例用的，16448/7555 是历史值，都试
+CANDIDATES = ["127.0.0.1:16384", "127.0.0.1:16448", "127.0.0.1:7555"]
 PKG = "com.phoenix.read"
 FRIDA_PORT = "27042"
 BRIDGE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "_txn", "bundle", "java-bridge.js")
+MUMU_MANAGER = r"C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe"
 
 
 def run(*args, timeout=60):
+    # 必须显式 utf-8 + errors=replace：MuMuManager 会输出中文（网卡名等），
+    # 默认按系统 GBK 解码会抛 UnicodeDecodeError，
+    # 而且是在 subprocess 的读线程里抛，主流程只会看到空输出。
     try:
         return subprocess.run([ADB] + list(args), capture_output=True,
-                              text=True, timeout=timeout)
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout)
+    except Exception as exc:
+        class R:
+            stdout = ""
+            stderr = "%s" % exc
+            returncode = 1
+        return R()
+
+
+def run_raw(cmd, timeout=120):
+    """跑非 adb 的命令（MuMuManager / netstat），同样显式 utf-8。"""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
     except Exception as exc:
         class R:
             stdout = ""
@@ -75,12 +93,96 @@ def pick_device():
     return None
 
 
+def check_bridge():
+    """桥接网卡模式是「模拟器起不来 / 反复掉线」的常见原因。
+
+    2026-10-07 实测：实例设了 net_bridge_open=true，绑到
+    "Realtek Gaming 2.5GbE Family Controller"，但这块网卡在系统里的
+    显示名是中文「以太网」—— 名称对不上，桥接绑不上，
+    于是 Android 网络栈起不来：VM 报 start_finished，
+    但 adb 端口 16384 始终不监听，模拟器起来几十秒就挂。
+    关掉桥接（改回 NAT）后端口 10 秒内就回来了。
+    """
+    if not os.path.isfile(MUMU_MANAGER):
+        return None
+    try:
+        out = run_raw([MUMU_MANAGER, "setting", "-v", "0",
+                             "-k", "net_bridge_open", "--info"]).stdout
+        data = json.loads(out)
+        cur = data.get("net_bridge_open")
+        if isinstance(cur, dict):
+            cur = cur.get("value") or cur.get("current_value")
+        return str(cur).lower() == "true"
+    except Exception:
+        return None
+
+
+def disable_bridge():
+    try:
+        run_raw([MUMU_MANAGER, "setting", "-v", "0",
+                        "-k", "net_bridge_open", "-val", "false"])
+        return True
+    except Exception:
+        return False
+
+
+def restart_vm():
+    try:
+        run_raw([MUMU_MANAGER, "control", "-v", "0", "restart"])
+        return True
+    except Exception:
+        return False
+
+
+def wait_port(timeout=240):
+    """等任一候选端口开始监听。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = run_raw(["netstat", "-ano"], timeout=30).stdout
+        except Exception:
+            out = ""
+        for cand in CANDIDATES:
+            port = cand.rsplit(":", 1)[1]
+            if ("127.0.0.1:%s" % port) in out and "LISTENING" in out:
+                return cand
+        time.sleep(5)
+    return None
+
+
 def main():
     keep_proxy = "--keep-proxy" in sys.argv
     ok = True
 
+    print("=== 0) 桥接网卡检查 ===")
+    bridged = check_bridge()
+    if bridged is True:
+        print("  net_bridge_open = true —— 这正是「模拟器起不来/反复掉线」的常见原因")
+        print("  （桥接绑定的网卡名与系统实际名称对不上时，Android 网络栈起不来，")
+        print("    VM 报 start_finished 但 adb 端口不监听）")
+        if disable_bridge():
+            print("  已关闭桥接，重启实例…")
+            restart_vm()
+            dev = wait_port()
+            print("  adb 端口:", dev or "仍未就绪")
+        else:
+            print("  [FAIL] 关闭桥接失败，请手动在 MuMu 设置里关掉「桥接模式」")
+            ok = False
+    elif bridged is False:
+        print("  net_bridge_open = false（NAT，正常）")
+    else:
+        print("  （读不到设置，跳过）")
+
+    print()
     print("=== 1) 连接模拟器 ===")
     dev = pick_device()
+    if not dev:
+        # 再等一次，可能实例刚重启完
+        dev = wait_port(timeout=120)
+        if dev:
+            run("connect", dev)
+            time.sleep(2)
+            dev = pick_device()
     if not dev:
         print("  [FAIL] 没找到模拟器；请先启动 MuMu")
         return 1

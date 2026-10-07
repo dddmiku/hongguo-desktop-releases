@@ -758,6 +758,24 @@ def sync_progress(series_id, episode, total=0, position=0, duration=0, series=No
     except Exception:
         vid = ""
     now = int(time.time() * 1000)
+    # 字段对齐手机端实测格式（2026-10-08 抓包，mitmproxy 解明文）。
+    # 手机端 POST /reading/bookapi/read_history/update/v 的 update_datas[0] 有 26 个字段；
+    # 我们原来只传 14 个。差异与取舍：
+    #   * use_soft_delete: 手机传 false，我们原来传 True。
+    #     这个字段服务端**不存**（返回里没有），但语义上是「软删除」开关，
+    #     传 True 有被理解成「标记删除」的风险，改成 false 对齐手机。
+    #   * update_timestamp_ms: 手机传 0，我们原来传 now。
+    #     服务端同样不存。传 0 对齐手机（避免影响服务端的更新时间推断）。
+    #   * chapter_index: 手机不传（服务端返回里也没有），但我们传了且**服务端保留了**，
+    #     说明这个值对我们有用（列表显示「上次看到第 N 集」），保留。
+    #   * book_id_str / genre_type: 手机不传，服务端会自己补。
+    #     我们传了也无害（服务端保留），保留以便服务端少做一次补全。
+    #   * 其余手机端有而我们没有的 14 个字段（digged_count / is_listen_mode /
+    #     is_multi_season / season_index / series_play_cnt / tone_id / recent_reads /
+    #     origin_novel_book_id / user_digg / is_interactive_game /
+    #     meet_guide_comment_tag / retain_video_play_time / user_playlet_comment_flag）
+    #     全是 0/false 的默认值，服务端会自行补默认，不传等价。
+    #   * vid: 手机必传（服务端返回里也有），我们本来就在传，保留。
     item = {
         "book_id": int(series_id),
         "book_id_str": series_id,
@@ -765,13 +783,13 @@ def sync_progress(series_id, episode, total=0, position=0, duration=0, series=No
         "vid_index": episode,
         "chapter_index": episode,
         "read_timestamp_ms": now,
-        "update_timestamp_ms": now,
+        "update_timestamp_ms": 0,
         "current_play_position": int(max(0, position)),
         "player_accumulate_total_time": int(max(0, position)),
         "duration": int(max(0, duration)),
         "episode_cnt": int(max(0, total)),
         "is_delete": False,
-        "use_soft_delete": True,
+        "use_soft_delete": False,
         "genre_type": 2150,
     }
     if vid and re.fullmatch(r"\d{8,24}", vid):
