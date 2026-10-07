@@ -37,7 +37,39 @@ import patch_backend                     # noqa: E402
 import rebrand_exe                       # noqa: E402
 from repack import align_index_html      # noqa: E402
 
-APP_DIR = os.environ.get("HONGGUO_APP_DIR", r"d:\Users\dddmiku\AppData\Local\红果免费短剧")
+def _app_dir():
+    """安装目录：环境变量 > 卸载注册项 > 历史默认值。
+
+    以前写死 d:\\Users\\...\\红果免费短剧。装到别的盘或换成安装包默认位置
+    （%LOCALAPPDATA%\\Programs\\红果免费短剧）之后，写死的路径会让 auto_patch
+    在错误的目录上工作（找不到 exe 就报失败，或更糟：去动一个已经没人用的旧目录）。
+    """
+    env = os.environ.get("HONGGUO_APP_DIR")
+    if env:
+        return env
+    try:
+        import winreg
+        for root, path in (
+            (winreg.HKEY_CURRENT_USER,
+             r"Software\Microsoft\Windows\CurrentVersion\Uninstall\红果免费短剧"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"Software\Microsoft\Windows\CurrentVersion\Uninstall\红果免费短剧"),
+        ):
+            try:
+                with winreg.OpenKey(root, path) as k:
+                    loc = str(winreg.QueryValueEx(k, "InstallLocation")[0]).strip()
+                loc = loc.strip('"')
+                if loc and os.path.isfile(
+                        os.path.join(loc, "hongguo-desktop-companion.exe")):
+                    return loc
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "红果免费短剧")
+
+
+APP_DIR = _app_dir()
 EXE = os.path.join(APP_DIR, "hongguo-desktop-companion.exe")
 BACKEND = os.path.join(APP_DIR, "backend")
 STATE = os.path.join(ROOT, "state.json")

@@ -59,3 +59,7 @@ tools/*.js
 src/frontend/_*.mjs
 verify/*.before-rollback
 verify/repro/_rbtest/
+
+# 安装包构建产物（350MB 载荷由 tools/build_installer.py 从上游原版重建，不入库）
+installer/payload/
+installer/app.ico

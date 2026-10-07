@@ -35,8 +35,42 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BACKEND = os.path.join(ROOT, "src", "backend")
 FRONTEND = os.path.join(ROOT, "src", "frontend")
-LIVE = r"D:\Users\dddmiku\AppData\Local\红果免费短剧\backend"
-LIVE_PY = r"D:\Users\dddmiku\AppData\Local\红果免费短剧\backend\python\python.exe"
+
+
+def _live_app_dir():
+    """安装目录：优先环境变量，其次从卸载注册项读，最后退回历史默认值。
+
+    以前这里是写死的 D 盘路径；换成安装包之后默认位置变成
+    %LOCALAPPDATA%\\Programs\\红果免费短剧，写死的路径会指向一个不存在的目录，
+    于是 --live 永远报「未找到安装目录」，看着像通过其实什么都没检查。
+    """
+    env = os.environ.get("HONGGUO_APP_DIR")
+    if env:
+        return env
+    try:
+        import winreg
+        for root, path in (
+            (winreg.HKEY_CURRENT_USER,
+             r"Software\Microsoft\Windows\CurrentVersion\Uninstall\红果免费短剧"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"Software\Microsoft\Windows\CurrentVersion\Uninstall\红果免费短剧"),
+        ):
+            try:
+                with winreg.OpenKey(root, path) as k:
+                    loc = winreg.QueryValueEx(k, "InstallLocation")[0]
+                loc = str(loc).strip().strip('"')
+                if loc:
+                    return loc
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "红果免费短剧")
+
+
+LIVE_DIR = _live_app_dir()
+LIVE = os.path.join(LIVE_DIR, "backend")
+LIVE_PY = os.path.join(LIVE_DIR, "backend", "python", "python.exe")
 
 RESULTS = []
 

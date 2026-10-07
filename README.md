@@ -280,8 +280,11 @@ tools/           构建 / 校验 / 部署 / 自动重注入
   verify_repack.py     回读 exe 并与 src 比对
   auto_patch.py        更新后自动重新注入（含计划任务）
   smoke_test.py        补丁链冒烟（41 项）
+  build_installer.py   打安装包（可复现：上游原版 + 我们的补丁）
+  extract_icon.py      从 exe 里抽出图标给 NSIS 用
   deploy.ps1           部署到本机安装目录
   restore.ps1          还原为原始安装
+installer/hongguo.nsi  安装包脚本（NSIS 3，Unicode）
 docs/architecture.md   逆向、打包与提速原理
 ```
 
@@ -292,9 +295,46 @@ python patches/patch_frontend.py                    # base/frontend/app.js -> sr
 python patches/patch_backend.py                     # base/backend -> src/backend/
 node --check src/frontend/app.js                    # 语法校验
 python tools/repack.py <原版 exe> dist/hongguo-desktop-companion.exe
+python tools/rebrand_exe.py dist/hongguo-desktop-companion.exe
 python tools/verify_repack.py
 powershell -File tools/deploy.ps1                   # 先退出应用
 ```
+
+## 打安装包（发给别人用）
+
+```powershell
+python tools/build_installer.py            # 一步到位：重建载荷 + 校验 + 打包
+python tools/build_installer.py --check    # 只重建并校验载荷，不打包
+```
+
+产物：`dist/hongguo-1.0.9-setup.exe`（约 99 MB）。
+
+**载荷不是从本机安装目录拷的**，而是从上游原版重建：
+
+| 来源 | 内容 |
+| --- | --- |
+| 上游原版安装目录（`_v109/extracted`） | 本仓库不跟踪的大件：`backend/python`、`backend/jre`、`backend/sign`、`capture/`、`frida/`、各类 `*.json` 配置 |
+| 本仓库 `src/backend/` 覆盖上去 | 补丁后的 `server.py` / `desktop_hls*.py` / `downloader.py` / `safeguards.py`，以及新增的 `desktop_account*.py` 与固定版本的 `requirements-windows.txt` |
+| `dist/hongguo-desktop-companion.exe` | 已打补丁并重打署名的 exe |
+
+这样分发包里不会混进 `.hq-bak-*`、`__pycache__`、`hls-work`、`*.orig-*`
+这类运行时垃圾。卸载程序由 NSIS 现场生成，**不用**上游那个（它会去连上游的更新地址）。
+
+### 安装包行为
+
+| 项 | 值 |
+| --- | --- |
+| 默认安装目录 | `%LOCALAPPDATA%\Programs\红果免费短剧` |
+| 升级既有安装 | 自动继承旧版安装位置（读卸载项的 `InstallLocation`），不会装出第二份 |
+| 权限 | `RequestExecutionLevel user`，**不需要管理员**，不弹 UAC |
+| 快捷方式 | 开始菜单 + 桌面（安装页可取消勾选；静默安装默认建桌面图标） |
+| WebView2 | 先查注册表；缺了才静默调用微软官方引导程序（本机已装则跳过） |
+| 卸载 | 问一次是否删观看记录（默认**保留**）；静默卸载一律保留 |
+| 静默安装 | `hongguo-1.0.9-setup.exe /S`，可用 `/D=C:\路径` 指定目录 |
+| 签名 | 未做代码签名，会有「未知发布者」提示（和上游一样） |
+
+> 安装包里的 WebView2 引导程序是**微软官方原件**（`Microsoft Edge Update Setup`，
+> 带微软签名），我们只做转发，没有改动。
 
 ## 实测结果（1.0.9，WebView2 远程调试，真实按键事件）
 
