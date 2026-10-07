@@ -289,11 +289,23 @@ hqMergedOnce=!0;
 void hqPersistMerged(merged);
 }catch(e){}finally{hqRefreshing=!1}}
 // 进入历史页时刷新一次（切页由下面的 hook 触发）。
+// WebView2 里 window 的 focus 事件不可靠（窗口最小化/还原、点回窗口都不一定发），
+// 所以再挂 Tauri 自己的窗口事件做兜底。实测运行中的页面支持
+// __TAURI_INTERNALS__.invoke("plugin:event|listen", ...)（返回了 listener id）。
+// 两条路都只是「触发一次刷新」，重复触发无副作用（hqRefreshing 已做去重）。
 if(!window.__hqRefreshHooked){
 window.__hqRefreshHooked=!0;
-window.addEventListener("focus",function(){void hqRefreshLibrary()});
+var hqOnWake=function(){void hqRefreshLibrary()};
+window.addEventListener("focus",hqOnWake);
 document.addEventListener("visibilitychange",function(){
 if(!document.hidden)void hqRefreshLibrary()});
+try{
+var hqT=window.__TAURI_INTERNALS__;
+if(hqT&&hqT.transformCallback&&hqT.invoke){
+var hqCb=hqT.transformCallback(function(){hqOnWake();return 1});
+hqT.invoke("plugin:event|listen",{event:"tauri://focus",target:{kind:"Any"},handler:hqCb}).catch(function(){});
+}
+}catch(e){}
 }
 '''
 
