@@ -69,6 +69,23 @@ def register(app):
             raise HTTPException(400, str(result.get("error") or "同步失败"))
         return result.get("session") or {}
 
+    @app.get("/desktop/account/raw_history")
+    def desktop_account_raw_history(limit: int = Query(30, ge=1, le=200),
+                                    series_id: str = Query("")):
+        """排查用：返回云端历史的原始字段（不脱敏、不改写）。
+
+        为什么需要它：/desktop/account/remote 只挑了几个字段返回，
+        排查「PC 写了但手机看不到」这类问题时必须看到云端原样返回什么。
+        """
+        j = A._history_raw(limit=limit)
+        data = j.get("data") or {}
+        items = data.get("data_list") or []
+        if series_id:
+            items = [x for x in items
+                     if str(x.get("book_id_str") or x.get("book_id") or "") == series_id]
+        return {"code": j.get("code"), "total": data.get("total"),
+                "count": len(items), "items": items}
+
     @app.get("/desktop/account/remote")
     def desktop_account_remote(limit: int = Query(30, ge=1, le=200)):
         history = A.remote_history(limit=limit)

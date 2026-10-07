@@ -432,6 +432,41 @@ def patch(text):
     p.s = p.s.replace(anchor, anchor + extra, 1)
     p.log.append("OK   键盘快捷键分支")
 
+    # ===== 15) 屏蔽官方更新通道 =====
+    # 上游的在线更新指向它自己的 release 仓库（写死在 tauri.conf 的
+    # updater.endpoints：https://github.com/waligoraamodio288-rgb/
+    # hongguo-desktop-releases/releases/latest/download/latest.json），
+    # 检查是每 6 小时自动跑一次的。
+    # 那个包里是**未打补丁的原版** exe，一旦点「下载并更新」，
+    # 我们所有补丁（含账号同步）会被整包覆盖掉；而且用户要的是别再走官方更新。
+    #
+    # 做法：在前端这一层把更新桥改成「永远说已是最新」，
+    # 并把安装入口改成空操作。这样：
+    #   * 自动轮询 6 小时一次 -> 永远拿到「无更新」，界面不弹提示；
+    #   * 设置页「检查更新」-> 显示「已是最新版本」；
+    #   * 即使有人手动触发安装，也只会被拒，不会下载覆盖。
+    # 后端补丁（patch_backend）同样会在 server.py 里加一道服务端兜底。
+    old_bridge = ('iu={status:()=>' + 'Te("get_update_status"),'
+                  'acknowledge:()=>' + 'Te("acknowledge_update_start"),'
+                  'check:()=>' + 'Te("check_app_update"),'
+                  'install:r=>' + 'Te("install_app_update",{version:r}),')
+    if old_bridge in p.s:
+        new_bridge = (
+            # status 是本地命令（不联网），保留它才能显示真实版本号。
+            'iu={status:()=>' + 'Te("get_update_status").then(function(s){'
+            'return Object.assign({},s,{configured:!0,update:null})})'
+            '.catch(function(){return{configured:!0,update:null}}),'
+            'acknowledge:()=>Promise.resolve(null),'
+            # 永远返回「没有更新」：不联网、不暴露上游 release 地址。
+            'check:()=>Promise.resolve({configured:!0,update:null}),'
+            # 安装入口直接拒绝，防止有人绕过检查触发下载覆盖。
+            'install:()=>Promise.reject(new Error("本地维护版已关闭在线更新")),'
+            'listen:()=>Promise.resolve(function(){}),')
+        p.s = p.s.replace(old_bridge, new_bridge, 1)
+        p.log.append("OK   屏蔽官方更新通道")
+    else:
+        p.log.append("!!   未找到更新桥（上游可能改名，需人工确认）")
+
     return p
 
 

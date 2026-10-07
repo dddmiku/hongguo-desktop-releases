@@ -808,17 +808,79 @@ def _history_raw(limit=30):
     return _json(r)
 
 
+# 服务端单次返回有硬上限。2026-10-07 实测：账号有 574 条历史，
+# 无论 limit 传 50/200/497/574/1000/2000，都只返回 497 条，
+# 必须靠 offset 翻页才能拿全（翻页累计 571 条）。
+_HISTORY_PAGE = 200
+_HISTORY_PAGE_MAX = 20        # 最多 4000 条，防跑飞
+
+
+def _history_all(max_items=2000):
+    """翻页取云端历史，返回 (items, total, ok, error)。
+
+    为什么必须翻页：只读第一页的话，排在后面的条目会被当成「云端没有」，
+    于是 remote_progress 会把它们判成进度 0 —— 合并逻辑随后可能用本地
+    较低的进度把它覆盖掉。这对历史很长的账号是真问题（实测 574 条里
+    有 77 条落在第一页之外）。
+    """
+    items = []
+    seen = set()
+    total = 0
+    last = {"ok": False, "error": ""}
+    for page in range(_HISTORY_PAGE_MAX):
+        offset = page * _HISTORY_PAGE
+        try:
+            r = _call("GET", "/reading/bookapi/read_history/list/v", extra={
+                "book_type": "2", "offset": str(offset), "limit": str(_HISTORY_PAGE),
+                "query_soft_deleted": "false", "is_first_load": "false",
+                "last_min_read_timestamp_ms": "0", "full_field": "false"})
+            j = _json(r)
+        except Exception as exc:
+            last = {"ok": False, "error": "%s" % type(exc).__name__}
+            break
+        if j.get("code") not in (0, "0"):
+            last = {"ok": False, "code": j.get("code"),
+                    "error": j.get("message") or "读取失败"}
+            break
+        data = j.get("data") or {}
+        total = int(data.get("total") or 0) or total
+        chunk = data.get("data_list") or []
+        if not chunk:
+            last = {"ok": True, "error": ""}
+            break
+        fresh = 0
+        for it in chunk:
+            key = str(it.get("book_id_str") or it.get("book_id") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            items.append(it)
+            fresh += 1
+            if len(items) >= max_items:
+                break
+        last = {"ok": True, "error": ""}
+        # 本页没有新条目 = 服务端开始重复返回，停。
+        if fresh == 0 or len(items) >= max_items:
+            break
+    return items, total, last["ok"], last.get("error", "")
+
+
 def remote_progress(series_id):
-    """查单部剧在云端的进度（用于「取最新」合并，避免把进度改小）。"""
+    """查单部剧在云端的进度（用于「取最新」合并，避免把进度改小）。
+
+    必须翻页找：只读第一页的话，排在后面的剧会被误判成「云端 0 集」，
+    合并逻辑随后就可能用本地较低的进度把它覆盖掉。
+    """
     if not is_logged_in():
         return {"ok": False, "error": "未登录红果账号"}
     series_id = str(series_id)
     if not re.fullmatch(r"[0-9]{8,24}", series_id):
         return {"ok": False, "error": "剧集标识不合法"}
-    j = _history_raw(limit=100)
-    if j.get("code") not in (0, "0"):
-        return {"ok": False, "code": j.get("code"), "error": j.get("message")}
-    for it in (((j.get("data") or {}).get("data_list")) or []):
+    items, _total, ok, error = _history_all()
+    if not ok:
+        return {"ok": False, "error": error or "读取失败"}
+    for it in items:
         if str(it.get("book_id_str") or it.get("book_id") or "") == series_id:
             return {"ok": True,
                     "episode": int(it.get("vid_index") or it.get("chapter_index") or 0),
@@ -830,16 +892,11 @@ def remote_progress(series_id):
 def remote_history(limit=30):
     if not is_logged_in():
         return {"ok": False, "error": "未登录红果账号"}
-    r = _call("GET", "/reading/bookapi/read_history/list/v", extra={
-        "book_type": "2", "offset": "0", "limit": str(int(limit)),
-        "query_soft_deleted": "false", "is_first_load": "false",
-        "last_min_read_timestamp_ms": "0", "full_field": "false"})
-    j = _json(r)
-    if j.get("code") not in (0, "0"):
-        return {"ok": False, "code": j.get("code"), "error": j.get("message")}
-    data = j.get("data") or {}
+    raw, total, ok, error = _history_all(max_items=max(1, int(limit)))
+    if not ok:
+        return {"ok": False, "error": error or "读取失败"}
     items = []
-    for it in (data.get("data_list") or []):
+    for it in raw:
         items.append({
             "seriesId": str(it.get("book_id_str") or it.get("book_id") or ""),
             "title": it.get("book_name") or "",
@@ -849,7 +906,7 @@ def remote_history(limit=30):
             "total": int(it.get("episode_cnt") or 0),
             "updatedAt": int(it.get("read_timestamp_ms") or 0),
         })
-    return {"ok": True, "total": int(data.get("total") or 0), "items": items}
+    return {"ok": True, "total": total or len(items), "items": items}
 
 
 # ---- 收藏（短剧书架） -----------------------------------------------------
