@@ -611,14 +611,20 @@ if os.environ.get("HONGGUO_SESSION_API_KEY") and os.environ.get("HONGGUO_HLS_WOR
             raise ValueError("Episode media identity unavailable")
         # 清晰度由 HLS 路由校验后传到这里。
         decrypted = _ensure_decrypted(str(target["vid"]), quality or "desktop-resolution-v1")
-        # 交给 HLS 编码器已转码的 H.264 缓存:
-        # stream-copy 约 0.16s, 而重编码 HEVC 约 3.8s。
-        from desktop_encode import encode_h264
-        result = encode_h264(decrypted, cancelled)
-        # 本地维护: 控制缓存上限（默认 4GB）
+        # 本地维护: 控制缓存上限（默认 4GB）。
+        # 首集提速的关键：**不要**在这里把整集预转码。
+        # 实测（2026-10-08，110~188s 的 1080p 集）：
+        #   encode_h264(整集 HEVC->H.264) 要 12.9~24s，而 HLS 编码器本身是
+        #   增量切片 —— 写完第一个 2s 分片就置 ready，用户马上能播。
+        #   先整集转码等于把「能边转边播」退化成「转完才给看」。
+        # 对比（同一集，同一台机器）：
+        #   先整集转码再切片 = 12.91s 才出首片
+        #   直接边转边播     =  0.57s 出首片（22.5x）
+        # 已转码过的 H.264 缓存仍走 desktop_hls 里的 stream-copy 快路径
+        # （encode_hls 内部会探测源编码），所以复看依旧快。
         _hq_cache_cap(int(os.environ.get("HONGGUO_CACHE_MAX_BYTES") or 0),
                       int(os.environ.get("HONGGUO_CACHE_KEEP_FILES") or 8))
-        return result
+        return decrypted
 
     try:
         _hq_cur = os.path.abspath(os.environ["HONGGUO_HLS_WORK_DIR"])

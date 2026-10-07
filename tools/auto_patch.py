@@ -177,8 +177,8 @@ def backup_once(exe, backend):
 # 每个后端文件「全部补丁步骤都已完成」的判据。
 # 只有全部命中才允许跳过；否则走一遍幂等补丁流程，把缺的步骤补上。
 FULL_MARKERS = {
-    "server.py": ("encode_h264(decrypted", "_hq_cache_cap", "_hq_cleanup_episode",
-                  "_hq_parent", "Invalid search query"),
+    "server.py": ("_hq_cache_cap", "_hq_cleanup_episode",
+                  "_hq_parent", "Invalid search query", "边转边播"),
     "desktop_hls.py": ("_hq_copy_hls",),
     "desktop_hls_service.py": ("normalize_desktop_quality",),
     "desktop_encode.py": ("cancelled is not None and cancelled()",),
@@ -225,7 +225,7 @@ def patch_live_backend(backend):
     MARKERS = {
         "desktop_hls.py": ("_hq_copy_hls",),
         "desktop_hls_service.py": ("normalize_desktop_quality",),
-        "server.py": ("encode_h264(decrypted",),
+        "server.py": ("边转边播",),
         "desktop_encode.py": ("cancelled is not None and cancelled()",),
         "desktop_account.py": ("def sms_login",),
         "desktop_account_api.py": ("def register",),

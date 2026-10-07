@@ -165,7 +165,7 @@ def main():
 
     # 校验：补丁标记必须在载荷里
     checks = []
-    for f, marks in (("server.py", ("_hq_cache_path", "encode_h264(decrypted",
+    for f, marks in (("server.py", ("_hq_cache_path", "边转边播",
                                    "Invalid search query")),
                      ("desktop_account.py", ("_history_all", "use_soft_delete")),
                      ("desktop_account_api.py", ("desktop",)),

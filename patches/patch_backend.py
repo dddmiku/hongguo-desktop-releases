@@ -348,7 +348,7 @@ def _hq_prune_poster_cache(keep_files=400, max_age_days=14):
     return removed
 '''
 
-CLEANUP_CALL_OLD = "        return encode_h264(decrypted, cancelled)"
+CLEANUP_CALL_OLD = "        return _ensure_decrypted(str(target[\"vid\"]), \"desktop-resolution-v1\")"
 
 # 追加到 server.py 文件末尾的启动清扫调用。
 # 必须放在文件末尾：它调用的两个函数都定义在 CLEANUP_BLOCK（同样在末尾）。
@@ -417,11 +417,10 @@ def img(url: str):
 '''
 
 CLEANUP_CALL_NEW = (
-    "        result = encode_h264(decrypted, cancelled)\n"
-    "        # 本地维护: 控制缓存上限（默认 4GB）\n"
-    "        _hq_cache_cap(int(os.environ.get(\"HONGGUO_CACHE_MAX_BYTES\") or 0),\n"
-    "                      int(os.environ.get(\"HONGGUO_CACHE_KEEP_FILES\") or 8))\n"
-    "        return result"
+    "        return _ensure_decrypted(str(target[\"vid\"]), \"desktop-resolution-v1\")\n"
+    "        # 本地维护: 控制缓存上限（默认 4GB）。\n"
+    "        # 注意：这里只是「把整集预转码」那一步拿掉的过渡形态；\n"
+    "        # 真正带 _hq_cache_cap 的版本由步骤 1 直接产出（见上面）。\n"
 )
 
 
@@ -530,10 +529,11 @@ def patch_server(src_dir, out_dir):
     steps = []
 
     # 步骤 1: _desktop_source 改为接受 quality + 走 H.264 缓存直通。
-    if "encode_h264(decrypted" in s:
+    if "边转边播" in s:
         steps.append("清晰度/缓存直通[已存在]")
     else:
-        m = re.search(r"def _desktop_source\(series_id, episode\):\n(.*?)\n\n", s, re.S)
+        m = re.search(r"def _desktop_source\(series_id, episode[^)]*\):\n(.*?)\n\n",
+                      s, re.S)
         if not m:
             raise Fail("[FAIL] 未找到 _desktop_source")
         old = m.group(1)
@@ -543,14 +543,24 @@ def patch_server(src_dir, out_dir):
             'return _ensure_decrypted(str(target["vid"]), "desktop-resolution-v1")',
             "# 清晰度由 HLS 路由校验后传到这里。\n"
             "        decrypted = _ensure_decrypted(str(target[\"vid\"]), quality or \"desktop-resolution-v1\")\n"
-            "        # 交给 HLS 编码器已转码的 H.264 缓存:\n"
-            "        # stream-copy 约 0.16s, 而重编码 HEVC 约 3.8s。\n"
-            "        from desktop_encode import encode_h264\n"
-            "        return encode_h264(decrypted, cancelled)")
+            "        # 本地维护: 控制缓存上限（默认 4GB）。\n"
+            "        # 首集提速的关键：**不要**在这里把整集预转码。\n"
+            "        # 实测（2026-10-08，110~188s 的 1080p 集）：\n"
+            "        #   encode_h264(整集 HEVC->H.264) 要 12.9~24s，而 HLS 编码器本身是\n"
+            "        #   增量切片 —— 写完第一个 2s 分片就置 ready，用户马上能播。\n"
+            "        #   先整集转码等于把「能边转边播」退化成「转完才给看」。\n"
+            "        # 对比（同一集，同一台机器）：\n"
+            "        #   先整集转码再切片 = 12.91s 才出首片\n"
+            "        #   直接边转边播     =  0.57s 出首片（22.5x）\n"
+            "        # 已转码过的 H.264 缓存仍走 desktop_hls 里的 stream-copy 快路径\n"
+            "        # （encode_hls 内部会探测源编码），所以复看依旧快。\n"
+            "        _hq_cache_cap(int(os.environ.get(\"HONGGUO_CACHE_MAX_BYTES\") or 0),\n"
+            "                      int(os.environ.get(\"HONGGUO_CACHE_KEEP_FILES\") or 8))\n"
+            "        return decrypted")
         if new == old:
             raise Fail("[FAIL] _desktop_source 未匹配到返回语句")
         s = s[:m.start()] + (SRC_SIG_NEW + "\n") + new + "\n\n" + s[m.end():]
-        steps.append("清晰度/缓存直通")
+        steps.append("清晰度/缓存直通（边转边播，不做整集预转码）")
 
     # 步骤 2: 每次取源后回收缓存上限。依赖步骤 1 产出的那一行。
     if "_hq_cache_cap" in s:

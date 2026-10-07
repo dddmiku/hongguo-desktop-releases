@@ -395,6 +395,11 @@ async function D(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/lo
 a(x||{loggedIn:!1}),hqDropStatus(),v("已退出账号同步。"),T("")}finally{m(!1)}}
 async function RS(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/restore",null,"POST",null);
 if(x&&x.loggedIn){a(x),hqSaveStatus(x),v("已恢复上次登录。"),T("")}else{v("恢复失败：没有可用的登录态"),T("error")}}catch(e){v("恢复失败："+hqErr(e)),T("error")}finally{m(!1)}}
+// 从模拟器同步登录态。设备身份（device_id/iid）只有从真实 App 里才有；
+// 全新机器上验证码接口会被服务端 403（返回空 body），这条是唯一的自助出路。
+async function SE(){m(!0),v("");try{const x=await hqAcctCall("/desktop/account/sync_emulator",null,"POST",null);
+if(x&&x.loggedIn){a(x),hqSaveStatus(x),v("已从模拟器同步登录态。"),T("")}
+else{v("同步失败：模拟器里还没有登录红果"),T("error")}}catch(e){v("同步失败："+hqErr(e)),T("error")}finally{m(!1)}}
 const A=!!(n&&n.loggedIn);
 return JSX.jsxs("section",{className:"content account-page",children:[
 JSX.jsxs("div",{className:"headline-row",children:[JSX.jsxs("div",{children:[
@@ -409,6 +414,11 @@ JSX.jsx("p",{children:A?"桌面端看完的集数与收藏会同步到手机红�
 A?null:JSX.jsxs("div",{className:"hq-acct-card",children:[
 JSX.jsxs("div",{children:[JSX.jsx("h2",{children:"用手机号登录"}),
 JSX.jsx("p",{className:"hq-acct-intro",children:"验证码由红果下发；桌面端只保存登录态，不上传任何账号密码。"})]}),
+(n&&n.deviceReady===!1)?JSX.jsxs("div",{className:"hq-acct-warn",role:"alert",children:[
+JSX.jsx("strong",{children:"本机缺少红果设备身份，验证码接口会被服务端拒绝。"}),
+JSX.jsx("p",{children:"红果对「没见过的设备」直接返回 403（连错误说明都不给），所以这里发不出验证码。设备身份只能从真实 App 里获得：在模拟器（MuMu 等）里安装并登录红果，再点下面的按钮同步过来。"}),
+JSX.jsx("button",{className:"secondary",onClick:()=>void SE(),disabled:g,
+children:g?"处理中…":"从模拟器同步登录态"})]}):null,
 JSX.jsxs("label",{className:"hq-acct-row",children:[JSX.jsx("span",{children:"手机号"}),
 JSX.jsx("input",{type:"tel",inputMode:"numeric",autoComplete:"off",value:o,placeholder:"11 位手机号",
 onChange:x=>c(x.target.value.replace(/\D/g,"").slice(0,11))})]}),
@@ -447,6 +457,10 @@ border-radius:10px;outline:none;appearance:none}
 .hq-acct-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px}
 .hq-acct-note{margin:16px 0 0;font-size:13px;line-height:1.6;color:var(--muted)}
 .hq-acct-note.error{color:#c0392b}
+.hq-acct-warn{margin:0 0 18px;padding:14px 16px;border:1px solid #e8c9a0;border-radius:12px;
+background:#fdf6ec;font-size:13px;line-height:1.65;color:#7a5a2e}
+.hq-acct-warn strong{display:block;margin-bottom:6px;color:#8a5a1e}
+.hq-acct-warn p{margin:0 0 12px}
 """
 
 

@@ -547,6 +547,34 @@ def _json(response):
         return {"code": -1, "message": "非 JSON 响应", "raw": response.text[:300]}
 
 
+# 设备身份问题的可操作提示。
+# 2026-10-08 实测定位：护照边缘对 device_id / iid **两个字段一起**校验
+#   · 已注册设备（从真机/模拟器抓到的）-> HTTP 200
+#   · 随机设备 -> HTTP 403 + **空 body**（连 JSON 都不给，所以前端显示
+#     「非 JSON 响应」这种看不出原因的报错）
+# 逐字段替换实验：device_id+iid 都换成已注册的 -> 200；只换其中一个 -> 403。
+# 所以必须两个字段同时是服务端注册过的。
+DEVICE_HINT = (
+    "本机没有可用的红果设备身份（device_id / iid），服务端拒绝了这次请求。"
+    "首次使用需要先获取设备身份：在模拟器（MuMu 等）里安装并登录红果，"
+    "然后点「从模拟器同步登录态」；或让提供安装包的人把 desktop-device.json "
+    "放到 %s 目录。"
+)
+
+
+def device_issue():
+    """返回 (是否有问题, 提示)。设备身份没拿到时给出可操作的说明。"""
+    try:
+        dev = load_device()
+    except Exception:
+        return True, DEVICE_HINT % _DATA_DIR
+    if not dev.get("device_id") or not dev.get("iid"):
+        return True, DEVICE_HINT % _DATA_DIR
+    if not dev.get("registered"):
+        return True, DEVICE_HINT % _DATA_DIR
+    return False, ""
+
+
 # ---- 验证码登录 -----------------------------------------------------------
 def _passport_form(mobile=None, code=None, with_device=False):
     """构造护照表单。
@@ -595,6 +623,13 @@ def send_code(mobile):
     mobile = re.sub(r"\D", "", str(mobile or ""))
     if not re.fullmatch(r"1\d{10}", mobile):
         return {"ok": False, "error": "手机号格式不正确"}
+    # 先自查设备身份：服务端对未注册设备直接 403 + 空 body，
+    # 前端只会看到「非 JSON 响应」，用户完全不知道要做什么。
+    bad, hint = device_issue()
+    if bad:
+        log_event("send_code", ok=False, reason="device_unregistered",
+                  mobile=mask_mobile(mobile))
+        return {"ok": False, "error": hint, "error_code": "device"}
     form = (_passport_form(mobile=normalize_mobile(mobile), with_device=True)
             + "&type=" + xor_hex(SMS_TYPE)
             + "&unbind_exist=" + xor_hex("1") + "&auto_read=0")
@@ -603,6 +638,10 @@ def send_code(mobile):
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}
+    # 403 + 空 body：不是网络问题，是设备身份被拒（服务端连错误码都不给）。
+    # 把它翻成人能看懂的话，否则用户只能看到「非 JSON 响应」。
+    if not ok and r.status_code in (401, 403) and not r.text.strip():
+        why, err_code = hint, "device"
     log_event("send_code", host=PASSPORT_HOST, http=r.status_code, ok=ok,
               mobile=mask_mobile(mobile), type=SMS_TYPE,
               error_code=err_code, message=str(j.get("message"))[:80],
@@ -659,12 +698,19 @@ def sms_login(mobile, code):
         return {"ok": False, "error": "手机号格式不正确"}
     if not re.fullmatch(r"\d{4,8}", code):
         return {"ok": False, "error": "验证码格式不正确"}
+    bad, hint = device_issue()
+    if bad:
+        log_event("sms_login_failed", ok=False, reason="device_unregistered",
+                  mobile=mask_mobile(mobile))
+        return {"ok": False, "error": hint, "error_code": "device"}
     form = _passport_form(mobile=normalize_mobile(mobile), code=code, with_device=True)
     r = _call("POST", "/passport/mobile/sms_login/", form=form,
               host=PASSPORT_HOST, passport=True)
     j = _json(r)
     ok, why, err_code = _passport_result(j)
     data = j.get("data") if isinstance(j.get("data"), dict) else {}
+    if not ok and r.status_code in (401, 403) and not r.text.strip():
+        why, err_code = hint, "device"
     if not ok:
         log_event("sms_login_failed", host=PASSPORT_HOST, http=r.status_code,
                   mobile=mask_mobile(mobile), code_len=len(code),
@@ -705,6 +751,7 @@ def _mask_uid(value):
 
 def public_session(session=None):
     s = session if session is not None else load_session()
+    bad, hint = device_issue()
     return {
         "loggedIn": bool(s.get("cookie") or s.get("token")),
         "userName": s.get("user_name") or "",
@@ -712,6 +759,10 @@ def public_session(session=None):
         "mobile": (s.get("mobile") or "")[:3] + "****" + (s.get("mobile") or "")[-4:]
         if s.get("mobile") else "",
         "savedAt": s.get("saved_at") or 0,
+        # 设备身份状态：没有它验证码接口会被服务端 403（空 body），
+        # 前端要据此提示用户走「从模拟器同步」而不是反复点发送。
+        "deviceReady": not bad,
+        "deviceHint": hint,
     }
 
 
@@ -1095,7 +1146,10 @@ def sync_from_emulator():
                 break
 
     if not (token or cookie):
-        return {"ok": False, "error": "模拟器里没有可用的登录态；请先在模拟器里登录一次"}
+        return {"ok": False, "error":
+                "模拟器里没有可用的登录态。请确认：1) MuMu 模拟器已启动；"
+                "2) 模拟器里装了红果（com.phoenix.read）并已登录；"
+                "3) 已执行过 adb connect / adb root（读应用私有目录需要 root）。"}
 
     # 先在内存里构造并验证，通过之后才落盘。
     # 之前是「先 save_session 再验」，验证失败也不回滚 ——
