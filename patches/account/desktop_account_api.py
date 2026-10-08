@@ -119,3 +119,15 @@ def register(app):
         if not result.get("ok"):
             raise HTTPException(502, str(result.get("error") or "收藏同步失败"))
         return {"synced": True, "favorite": bool(favorite)}
+
+
+def register_update(app):
+    """本地维护: 更新检测路由（指向本分支自己的仓库）。"""
+    import desktop_update as U
+
+    @app.get("/desktop/update/check")
+    def desktop_update_check(force: bool = Query(False)):
+        if force:
+            U._cache["at"] = 0.0
+            U._cache["data"] = None
+        return U.public()

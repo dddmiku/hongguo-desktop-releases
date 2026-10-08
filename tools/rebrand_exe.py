@@ -43,6 +43,18 @@ OLD_OWNER_MARKERS = (
 ANCHOR = b'"author": {'
 DEFAULT_REPO = "https://github.com/dddmiku/hongguo-desktop-releases"
 
+# 本维护分支的版本号。上游是 1.0.9；我们加了功能，必须有自己的版本，
+# 否则「关于 / 更新」里看到的还是 1.0.9，用户分不清装的是哪一版。
+#
+# 版本号写在 exe 的 RT_VERSION 资源里（PE 版本信息），两处：
+#   1) StringFileInfo 的 "FileVersion" / "ProductVersion" 字符串
+#   2) VS_FIXEDFILEINFO 里的两个 dword
+# 这个资源**后面紧跟图标数据**，长度记在资源目录里，所以只能等长原地覆盖：
+# 新版本串的字节数必须与旧的完全一致（UTF-16LE，含结尾 NUL）。
+# 1.0.9 -> 1.1.0 都是 5 个字符，天然等长；换成 1.0.10 会变长，需要搬资源，别用。
+OUR_VERSION = os.environ.get("HONGGUO_VERSION", "1.1.0")
+UPSTREAM_VERSION = "1.0.9"
+
 # 内嵌 config 里另有一处上游标识：updater 的更新端点。
 # 这条是**死配置**（前端更新桥已被 patch_frontend 第 15 步改成永远返回
 # 「无更新」，后端另有兜底），但里面带着原作者的仓库名，要一并清掉。
@@ -148,6 +160,105 @@ def locate(d):
     raise SystemExit("[FAIL] 没找到引用 author 段的长度立即数（上游改写法了，需人工确认）")
 
 
+def _find_version_resource(d):
+    """定位 RT_VERSION 资源：(文件偏移, 长度)。"""
+    pe = d.find(b"PE\x00\x00")
+    if pe < 0:
+        return None
+    nsec = struct.unpack_from("<H", d, pe + 6)[0]
+    optsz = struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    magic = struct.unpack_from("<H", d, opt)[0]
+    dd = opt + (112 if magic == 0x20b else 96)
+    rsrc_rva, _ = struct.unpack_from("<II", d, dd + 16)
+    sec0 = opt + optsz
+    secs = []
+    for i in range(nsec):
+        o = sec0 + i * 40
+        vs, va, rs, rp = struct.unpack_from("<IIII", d, o + 8)
+        secs.append((va, vs, rp, rs))
+
+    def r2f(rva):
+        for va, vs, rp, rs in secs:
+            if va <= rva < va + vs and rva - va < rs:
+                return rp + (rva - va)
+        return None
+
+    base = r2f(rsrc_rva)
+    if base is None:
+        return None
+
+    def entries(off):
+        fo = base + off
+        n_named, n_id = struct.unpack_from("<HH", d, fo + 12)
+        out = []
+        for k in range(n_named + n_id):
+            e = fo + 16 + k * 8
+            name, child = struct.unpack_from("<II", d, e)
+            out.append((name & 0x7FFFFFFF, bool(child & 0x80000000),
+                        child & 0x7FFFFFFF))
+        return out
+
+    top = {i: c for i, _isdir, c in entries(0)}
+    if 16 not in top:                      # RT_VERSION
+        return None
+    _i, _isdir, child = entries(top[16])[0]
+    _i, _isdir, c2 = entries(child)[0]
+    entry = base + c2
+    rva, size = struct.unpack_from("<II", d, entry)
+    fo = r2f(rva)
+    return (fo, size) if fo is not None else None
+
+
+def rewrite_version(d, new=None, old=UPSTREAM_VERSION):
+    """把 exe 的 PE 版本号从 old 改成 new（等长原地覆盖）。
+
+    只动 FileVersion / ProductVersion —— 它们从 "1.0.9" 变 "1.1.0" 仍等长。
+    CompanyName / ProductName / LegalCopyright 不改：它们比原值长，
+    扩了会顶掉后面紧跟的图标（那个资源的大小记在资源目录里）。
+    """
+    new = new or OUR_VERSION
+    found = _find_version_resource(d)
+    if not found:
+        return None
+    fo, size = found
+    blob = bytearray(d[fo:fo + size])
+
+    old_b, new_b = old.encode("utf-16-le"), new.encode("utf-16-le")
+    if len(old_b) != len(new_b):
+        raise SystemExit(
+            "[FAIL] 版本号 %s -> %s 字节数不同（%d vs %d）；版本资源只能等长覆盖，"
+            "请选位数相同的版本号（如 1.0.9 -> 1.1.0）" % (old, new, len(old_b), len(new_b)))
+
+    n_str = 0
+    pos = 0
+    while True:
+        p = blob.find(old_b, pos)
+        if p < 0:
+            break
+        blob = blob[:p] + new_b + blob[p + len(old_b):]
+        n_str += 1
+        pos = p + len(new_b)
+
+    sig = blob.find(b"\xbd\x04\xef\xfe")            # VS_FIXEDFILEINFO 签名
+    n_fixed = 0
+    if sig >= 0:
+        def pack(v):
+            parts = [int(x) for x in v.split(".")]
+            while len(parts) < 4:
+                parts.append(0)
+            return ((parts[0] << 16) | parts[1], (parts[2] << 16) | parts[3])
+        ms, ls = pack(new)
+        for off in (sig + 8, sig + 16):             # FileVersion, ProductVersion
+            struct.pack_into("<II", blob, off, ms, ls)
+            n_fixed += 1
+
+    if len(blob) != size:
+        raise SystemExit("[FAIL] 版本资源长度变了（%d -> %d）" % (size, len(blob)))
+    d[fo:fo + size] = blob
+    return {"strings": n_str, "fixed": n_fixed, "fo": fo, "size": size}
+
+
 def build_author_json(repo, length):
     """生成新的 author 段，用 CRLF 空行补齐到指定字节数（纯空白，不改语义）。"""
     issues = repo.rstrip("/") + "/issues/new/choose"
@@ -189,6 +300,16 @@ def rebrand_file(exe, repo=DEFAULT_REPO, check=False, quiet=False):
         say("author 段   : %#x..%#x (%d 字节)" % (start, start + length, length))
         say("引用点      : lea @%#x, 长度立即数 @%#x" % (lea_fo, imm_fo))
         say("剩余原作者串: %s" % (left or "无"))
+        ver = _find_version_resource(d)
+        if ver:
+            blob = bytes(d[ver[0]:ver[0] + ver[1]])
+            say("PE 版本     : 上游 %s 残留=%s / 本分支 %s=%s"
+                % (UPSTREAM_VERSION,
+                   "是" if UPSTREAM_VERSION.encode("utf-16-le") in blob else "否",
+                   OUR_VERSION,
+                   "是" if OUR_VERSION.encode("utf-16-le") in blob else "否"))
+        else:
+            say("PE 版本     : 未找到 RT_VERSION 资源")
         return 0 if not left else 1
 
     old = bytes(d[start:start + length])
@@ -197,6 +318,7 @@ def rebrand_file(exe, repo=DEFAULT_REPO, check=False, quiet=False):
         raise SystemExit("[FAIL] 长度不符")
     d[start:start + length] = body
     ep_fo = rewrite_endpoint(d, repo)
+    ver = rewrite_version(d)
     io.open(exe, "wb").write(bytes(d))
 
     left = [m.decode() for m in OLD_OWNER_MARKERS if m in bytes(d)]
@@ -207,6 +329,11 @@ def rebrand_file(exe, repo=DEFAULT_REPO, check=False, quiet=False):
         say("[!] 未找到内嵌更新端点（可能已被上游移除）")
     else:
         say("[OK] 更新端点 %#x 原地覆盖 %d 字节" % (ep_fo, len(OLD_ENDPOINT)))
+    if ver is None:
+        say("[!] 未找到 PE 版本资源，版本号未改")
+    else:
+        say("[OK] PE 版本 %s -> %s（字符串 %d 处 / FIXEDFILEINFO %d 处）"
+            % (UPSTREAM_VERSION, OUR_VERSION, ver["strings"], ver["fixed"]))
     if left:
         say("[!] 仍有原作者串残留: %s" % left)
         return 1

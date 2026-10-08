@@ -83,7 +83,8 @@ PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "deskt
 # 我们新增、上游基线里没有的模块（从 patches/account/ 重建）。
 # 注意：safeguards.py 是上游自带文件（只是被补丁改过），不能列在这里 ——
 # 列进来会让 auto_patch 从 patches/account/ 找它，找不到就跳过，等于漏打补丁。
-ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py")
+ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py",
+                 "desktop_update.py")
 
 
 def sha(path):

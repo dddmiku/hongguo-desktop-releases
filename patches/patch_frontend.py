@@ -27,6 +27,16 @@ SPEED_NEW = "[.75,1,1.25,1.5,2,2.5,3]"
 # 面板用它渲染）。exe 里另有一份编译进 tauri.conf.json 的字面量，由
 # tools/rebrand_exe.py 在重打包时处理 —— 那一条不是资源、也没有指针引用，
 # 长度是编译期立即数，只能等长替换。
+# 版本号与 tools/rebrand_exe.py 的 OUR_VERSION 必须一致：
+# 前者写进 PE 版本资源，后者写进前端（Tauri 报的版本是 Rust 编译期常量，
+# 改不了，只能在前端覆盖）。这里直接复用同一份定义，避免两处漂移。
+try:
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "tools"))
+    from rebrand_exe import OUR_VERSION
+except Exception:            # tools/ 不可用时退回默认值
+    OUR_VERSION = "1.1.0"
+
 DIST_REPO = "https://github.com/dddmiku/hongguo-desktop-releases"
 DIST_ISSUES = DIST_REPO + "/issues/new/choose"
 # 三个入口统一指向本仓库：关注 -> 仓库主页，反馈 / 需求 -> 新建 issue。
@@ -49,6 +59,13 @@ NK_AUTHOR_OLD = ('{destination:"author",title:"关注作者",'
 NK_AUTHOR_NEW = ('{destination:"author",title:"关注项目",'
                  'description:"了解新版本和接下来做的小工具。",'
                  'action:"打开项目主页"}')
+
+# 更新提示的文案（上游那套是自动下载替换，我们不这么做）。
+UPD_BTN_OLD = "下载并更新（将重启）"
+UPD_BTN_NEW = "打开下载页"
+UPD_HINT_OLD = "更新时将退出并重新打开软件，可在看完后再更新。"
+UPD_HINT_NEW = ("会打开下载页，下载新版安装包后手动安装；"
+                "安装包会覆盖当前版本，观看记录与收藏保留。")
 
 QUAL_HELPERS = (
     'function hqQuals(){return["auto","1080p","720p","540p","480p"]}'
@@ -468,30 +485,67 @@ def patch(text):
     # 那个包里是**未打补丁的原版** exe，一旦点「下载并更新」，
     # 我们所有补丁（含账号同步）会被整包覆盖掉；而且用户要的是别再走官方更新。
     #
-    # 做法：在前端这一层把更新桥改成「永远说已是最新」，
-    # 并把安装入口改成空操作。这样：
-    #   * 自动轮询 6 小时一次 -> 永远拿到「无更新」，界面不弹提示；
-    #   * 设置页「检查更新」-> 显示「已是最新版本」；
-    #   * 即使有人手动触发安装，也只会被拒，不会下载覆盖。
-    # 后端补丁（patch_backend）同样会在 server.py 里加一道服务端兜底。
+    # 做法：前端这一层把更新桥整个接管 —— 不再问 Tauri 的 updater，
+    # 改成问我们自己的后端 /desktop/update/check（它去查本分支的仓库）。
+    # 安装不做「下载并替换」（Tauri 那步要原作者私钥签名，我们签不出来，
+    # 硬走只会下载完验签失败），而是打开 Release 页面让用户下安装包 ——
+    # 安装包就是我们构建的，装完即是新版。这样「检查更新」是真能用的。
     old_bridge = ('iu={status:()=>' + 'Te("get_update_status"),'
                   'acknowledge:()=>' + 'Te("acknowledge_update_start"),'
                   'check:()=>' + 'Te("check_app_update"),'
                   'install:r=>' + 'Te("install_app_update",{version:r}),')
     if old_bridge in p.s:
         new_bridge = (
-            # status 是本地命令（不联网），保留它才能显示真实版本号。
-            'iu={status:()=>' + 'Te("get_update_status").then(function(s){'
-            'return Object.assign({},s,{configured:!0,update:null})})'
-            '.catch(function(){return{configured:!0,update:null}}),'
+            # 更新检查结果缓存：状态轮询很频繁，别每次都打后端/GitHub。
+            'iu={__hq:{at:0,data:null,inflight:null},'
+            # Tauri 的 get_update_status 报的版本号是 **Rust 编译期常量**
+            # （来自 tauri.conf.json，进了二进制），改 exe 的 PE 版本资源它也不会变。
+            # 所以这里用我们自己的版本号覆盖掉，保证「当前版本」和「检查更新」
+            # 的比对基准一致。改版本时同步 tools/rebrand_exe.py 的 OUR_VERSION。
+            '__v:"' + OUR_VERSION + '",'
+            # status 保留 Tauri 的本地命令（不联网）拿真实版本号，
+            # 但 update 字段改由我们自己的检查填充。
+            'status:()=>' + 'Te("get_update_status").then(function(s){'
+            'return Object.assign({},s,{configured:!0,update:null,'
+            'currentVersion:iu.__v})})'
+            '.catch(function(){return{configured:!0,update:null,currentVersion:iu.__v}}),'
             'acknowledge:()=>Promise.resolve(null),'
-            # 永远返回「没有更新」：不联网、不暴露上游 release 地址。
-            'check:()=>Promise.resolve({configured:!0,update:null}),'
-            # 安装入口直接拒绝，防止有人绕过检查触发下载覆盖。
-            'install:()=>Promise.reject(new Error("本地维护版已关闭在线更新")),'
+            'check:function(force){var m=iu.__hq;'
+            'if(!force&&m.data&&Date.now()-m.at<6e5)return Promise.resolve(m.data);'
+            'if(m.inflight)return m.inflight;'
+            'var v=null;try{v=JSON.parse(localStorage.getItem("guoban:api")||"null")}catch(e){}'
+            'if(!v||!v.origin)return Promise.resolve({configured:!0,update:null,currentVersion:iu.__v});'
+            'm.inflight=fetch(v.origin+"/desktop/update/check"+(force?"?force=true":""),'
+            '{headers:{"x-api-key":v.key},credentials:"omit"}).then(function(r){'
+            'if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(j){'
+            'm.at=Date.now();'
+            # 界面读的是 status.update（**嵌套对象**，跟 Tauri 的返回形状一致），
+            # 不是平铺字段。之前返回平铺的 version，界面拿不到 status.update，
+            # 于是永远显示「已是最新版本」（实测踩过）。
+            # 「无更新」时 update 必须是 null，界面据此显示「已是最新版本」。
+            'var u=j&&j.updateAvailable?{version:String(j.latestVersion||""),'
+            'currentVersion:String(j.currentVersion||iu.__v),notes:String(j.notes||""),'
+            'page:String(j.page||""),assetUrl:String(j.assetUrl||""),'
+            'assetName:String(j.assetName||""),assetSize:Number(j.assetSize)||0}:null;'
+            'm.data={configured:!0,update:u,currentVersion:String('
+            '(j&&j.currentVersion)||iu.__v)};'
+            'return m.data}).catch(function(e){'
+            'return {configured:!0,update:null,currentVersion:iu.__v,'
+            'error:String(e&&e.message||e)}})'
+            '.then(function(x){m.inflight=null;return x});'
+            'return m.inflight},'
+            # 安装入口：打开项目主页（Release 就在那里）。
+            # 只能走 open_project_link —— Tauri 的 opener/shell 插件被 ACL 禁了，
+            # window.open 也被拦，open_web_preview 只放行红果自己的域名（都实测过）。
+            # 这个命令按配置键打开系统浏览器，我们已把 author 指向本仓库。
+            'install:()=>' + 'Te("open_project_link",{destination:"author"})'
+            '.then(function(){return null},function(){'
+            'throw new Error("未能打开浏览器，请手动访问 "'
+            '+String((iu.__hq&&iu.__hq.data&&iu.__hq.data.update'
+            '&&iu.__hq.data.update.page)||""))}),'
             'listen:()=>Promise.resolve(function(){}),')
         p.s = p.s.replace(old_bridge, new_bridge, 1)
-        p.log.append("OK   屏蔽官方更新通道")
+        p.log.append("OK   更新检测改指向本分支仓库（安装走下载页）")
     else:
         p.log.append("!!   未找到更新桥（上游可能改名，需人工确认）")
 
@@ -512,6 +566,13 @@ def patch(text):
     p.sub(re.escape(INTRO_OLD), INTRO_NEW, "作者信息·面板说明")
     p.sub(re.escape(FOOTNOTE_OLD), FOOTNOTE_NEW, "作者信息·面板脚注")
     p.sub(re.escape(NK_AUTHOR_OLD), NK_AUTHOR_NEW, "作者信息·关注入口文案")
+
+    # 更新提示的文案：上游是「下载并更新（将重启）」+「更新时会退出并重新打开」，
+    # 那是它自己那套「下载 -> 验签 -> 自动替换」。我们不做自动替换
+    # （那一步要原作者私钥签名），实际是打开下载页让用户手动装，
+    # 所以按钮和说明必须跟着改，否则等于骗用户。
+    p.sub(re.escape(UPD_BTN_OLD), UPD_BTN_NEW, "更新·按钮文案")
+    p.sub(re.escape(UPD_HINT_OLD), UPD_HINT_NEW, "更新·说明文案")
 
     return p
 

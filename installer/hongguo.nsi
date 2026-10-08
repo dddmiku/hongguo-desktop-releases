@@ -25,7 +25,7 @@ SetCompressorDictSize 64
 !define APP_NAME      "红果免费短剧"
 !define APP_ID        "hongguo-desktop-companion"
 !define PUBLISHER     "dddmiku"
-!define VERSION       "1.0.9"
+!define VERSION       "1.1.0"
 !define REPO_URL      "https://github.com/dddmiku/hongguo-desktop-releases"
 !define UNINST_KEY    "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
 !define WEBVIEW2_GUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
@@ -41,7 +41,7 @@ RequestExecutionLevel user
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "1.0.9.0"
+VIProductVersion "1.1.0.0"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序"
 VIAddVersionKey "FileVersion"     "${VERSION}"

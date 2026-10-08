@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 DEFAULT_PRISTINE = os.path.join(ROOT, "_v109", "extracted")
 DEFAULT_EXE = os.path.join(ROOT, "dist", "hongguo-desktop-companion.exe")
-DEFAULT_OUT = os.path.join(ROOT, "dist", "hongguo-1.0.9-setup.exe")
+DEFAULT_OUT = os.path.join(ROOT, "dist", "hongguo-1.1.0-setup.exe")
 INST = os.path.join(ROOT, "installer")
 PAYLOAD = os.path.join(INST, "payload")
 WEBVIEW2 = os.path.join(INST, "webview2")

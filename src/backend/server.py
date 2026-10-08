@@ -861,5 +861,8 @@ def desktop_cache_prune():
 try:
     import desktop_account_api as _hq_account_api
     _hq_account_api.register(app)
+    # 本地维护: 更新检测指向本分支自己的仓库（Tauri 自带的 updater 需要
+    # 原作者私钥签名，我们用不了，所以走自己的检测 + 打开下载页）。
+    _hq_account_api.register_update(app)
 except Exception as _hq_account_error:  # 账号同步不可用时不影响播放
     print("[server] 账号同步未启用:", type(_hq_account_error).__name__)

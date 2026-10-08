@@ -4,11 +4,12 @@
 token 从 git 凭据管理器取（不落盘、不进命令行、不打印）。
 
 用法:
-    python tools/release_installer.py --tag v1.0.9
-    python tools/release_installer.py --tag v1.0.9 --notes-file notes.md
+    python tools/release_installer.py --tag v1.1.0
+    python tools/release_installer.py --tag v1.1.0 --notes-file notes.md
     python tools/release_installer.py --list
 """
 import argparse
+import datetime
 import io
 import json
 import os
@@ -60,12 +61,12 @@ def call(method, url, secret, payload=None, raw=None, ctype=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="v1.0.9")
+    ap.add_argument("--tag", default="v1.1.0")
     ap.add_argument("--name")
     ap.add_argument("--notes")
     ap.add_argument("--notes-file")
     ap.add_argument("--asset", default=os.path.join(
-        ROOT, "dist", "hongguo-1.0.9-setup.exe"))
+        ROOT, "dist", "hongguo-1.1.0-setup.exe"))
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
 
@@ -86,7 +87,7 @@ def main():
         notes = io.open(a.notes_file, encoding="utf-8").read()
     if not notes:
         notes = ("红果免费短剧 桌面版 · 本地维护分支\n\n"
-                 "下载 `hongguo-1.0.9-setup.exe` 安装即可。安装不需要管理员权限。\n\n"
+                 "下载 `hongguo-1.1.0-setup.exe` 安装即可。安装不需要管理员权限。\n\n"
                  "本安装包为**上游 1.0.9 的本地二次维护**，已包含：\n"
                  "- 3 倍速（0.75–3）、清晰度可选（自动/1080p/720p/540p/480p）\n"
                  "- 完整键盘快捷键；点过按钮后按空格不再误触发该按钮\n"
@@ -128,6 +129,30 @@ def main():
     if s not in (200, 201):
         raise SystemExit("[FAIL] 上传: %s %s" % (s, d))
     print("[OK] 已上传: %s" % d.get("browser_download_url"))
+
+    # latest.json：更新检测用的静态文件（不限流、不需要 token）。
+    # 客户端读 https://github.com/<repo>/releases/latest/download/latest.json
+    version = a.tag.lstrip("v")
+    latest = {
+        "version": version,
+        "notes": notes,
+        "pub_date": datetime.datetime.now(datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "platforms": {
+            "windows-x86_64": {
+                "url": d.get("browser_download_url") or "",
+                "size": len(raw),
+            }
+        },
+    }
+    blob = json.dumps(latest, ensure_ascii=False, indent=2).encode("utf-8")
+    s, d2 = call("POST", "%s?name=latest.json" % upload_url, tok,
+                 raw=blob, ctype="application/json")
+    if s not in (200, 201):
+        print("[!] latest.json 上传失败: %s %s" % (s, d2))
+        print("    更新检测会退回 GitHub API（有速率限制）")
+    else:
+        print("[OK] 已上传 latest.json（version=%s）" % version)
     return 0
 
 
