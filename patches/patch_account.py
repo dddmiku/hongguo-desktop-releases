@@ -415,8 +415,8 @@ A?null:JSX.jsxs("div",{className:"hq-acct-card",children:[
 JSX.jsxs("div",{children:[JSX.jsx("h2",{children:"用手机号登录"}),
 JSX.jsx("p",{className:"hq-acct-intro",children:"验证码由红果下发；桌面端只保存登录态，不上传任何账号密码。"})]}),
 (n&&n.deviceReady===!1)?JSX.jsxs("div",{className:"hq-acct-warn",role:"alert",children:[
-JSX.jsx("strong",{children:"本机缺少红果设备身份，验证码接口会被服务端拒绝。"}),
-JSX.jsx("p",{children:"红果对「没见过的设备」直接返回 403（连错误说明都不给），所以这里发不出验证码。设备身份只能从真实 App 里获得：在模拟器（MuMu 等）里安装并登录红果，再点下面的按钮同步过来。"}),
+JSX.jsx("strong",{children:"本机缺少随包携带的设备身份，验证码接口会被服务端拒绝。"}),
+JSX.jsx("p",{children:"红果对「没见过的设备」直接返回 403（连错误说明都不给），所以这里发不出验证码。正常情况下安装包已经带了一台合法设备身份，出现这条说明文件缺失——重新安装一次安装包即可恢复。"}),
 JSX.jsx("button",{className:"secondary",onClick:()=>void SE(),disabled:g,
 children:g?"处理中…":"从模拟器同步登录态"})]}):null,
 JSX.jsxs("label",{className:"hq-acct-row",children:[JSX.jsx("span",{children:"手机号"}),

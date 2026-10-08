@@ -534,15 +534,54 @@ def patch(text):
             'error:String(e&&e.message||e)}})'
             '.then(function(x){m.inflight=null;return x});'
             'return m.inflight},'
-            # 安装入口：打开项目主页（Release 就在那里）。
-            # 只能走 open_project_link —— Tauri 的 opener/shell 插件被 ACL 禁了，
-            # window.open 也被拦，open_web_preview 只放行红果自己的域名（都实测过）。
-            # 这个命令按配置键打开系统浏览器，我们已把 author 指向本仓库。
-            'install:()=>' + 'Te("open_project_link",{destination:"author"})'
-            '.then(function(){return null},function(){'
-            'throw new Error("未能打开浏览器，请手动访问 "'
-            '+String((iu.__hq&&iu.__hq.data&&iu.__hq.data.update'
-            '&&iu.__hq.data.update.page)||""))}),'
+            # 安装入口：**应用内直接下载**，不跳浏览器。
+            # 后端起一个下载任务（Gitee 优先，国内快；GitHub 兜底），
+            # 前端轮询进度，下完交给系统打开安装包（弹安装向导）。
+            # 为什么不让浏览器去下：Gitee 的下载是带时效 token 的跳转，
+            # 交给浏览器会跳到 Gitee 页面而不是「立即开始下载」。
+            'install:function(){'
+            'var m=iu.__hq,u=m.data&&m.data.update;'
+            'if(!u)return Promise.reject(new Error("没有可下载的版本"));'
+            'var v=null;try{v=JSON.parse(localStorage.getItem("guoban:api")||"null")}catch(e){}'
+            'if(!v||!v.origin)return Promise.reject(new Error("本机链路未就绪，请先播放任意一集"));'
+            'if(m.task){if(m.task.phase==="done")return iu.__launch();'
+            'return Promise.resolve(null)}'
+            'var q="?version="+encodeURIComponent(u.version)'
+            '+(u.sha256?("&sha256="+encodeURIComponent(u.sha256)):"");'
+            'return fetch(v.origin+"/desktop/update/download"+q,{method:"POST",'
+            'headers:{"x-api-key":v.key},credentials:"omit"}).then(function(r){'
+            'if(!r.ok)return r.json().catch(function(){return{}}).then(function(j){'
+            'throw new Error(String(j&&j.detail||("HTTP "+r.status))) });'
+            'return r.json()}).then(function(t){m.task=t;return iu.__poll()})},'
+            # 轮询下载进度，喂给界面的 progress（界面已有进度显示逻辑）
+            '__poll:function(){var m=iu.__hq,v=null;'
+            'try{v=JSON.parse(localStorage.getItem("guoban:api")||"null")}catch(e){}'
+            'if(!v||!v.origin||!m.task)return Promise.resolve(null);'
+            'return fetch(v.origin+"/desktop/update/download/"+m.task.id,'
+            '{headers:{"x-api-key":v.key},credentials:"omit"}).then(function(r){return r.json()})'
+            '.then(function(t){m.task=t;'
+            'if(t.phase==="done"){try{m.onProgress&&m.onProgress({phase:"installing",'
+            'downloaded:t.size,total:t.size})}catch(e){}return iu.__launch()}'
+            'if(t.phase==="error"){try{m.onProgress&&m.onProgress(null)}catch(e){}'
+            'throw new Error(t.error||"下载失败")}'
+            'try{m.onProgress&&m.onProgress({phase:"downloading",'
+            'downloaded:t.downloaded,total:t.total})}catch(e){}'
+            'return new Promise(function(res){setTimeout(res,700)}).then(function(){return iu.__poll()})})},'
+            # 下完打开安装包（会弹安装向导），然后退出当前程序，
+            # 否则安装程序会因为我们还占着 exe 而跳过文件替换。
+            '__launch:function(){var m=iu.__hq,v=null;'
+            'try{v=JSON.parse(localStorage.getItem("guoban:api")||"null")}catch(e){}'
+            'var done=function(){try{m.onProgress&&m.onProgress(null)}catch(e){}'
+            'return Promise.resolve(null)};'
+            'if(!v||!v.origin||!m.task)return done();'
+            'return fetch(v.origin+"/desktop/update/download/"+m.task.id+"/launch",'
+            '{method:"POST",headers:{"x-api-key":v.key},credentials:"omit"})'
+            '.then(function(r){return r.json()}).then(function(){'
+            'm.task=null;m.data=null;m.at=0;'
+            'return new Promise(function(res){setTimeout(res,1500)}).then(function(){'
+            'return ' + 'Te("quit_app")}).catch(function(){}).then(done)})'
+            '.catch(function(e){try{m.onProgress&&m.onProgress(null)}catch(x){}'
+            'throw e})},'
             'listen:()=>Promise.resolve(function(){}),')
         p.s = p.s.replace(old_bridge, new_bridge, 1)
         p.log.append("OK   更新检测改指向本分支仓库（安装走下载页）")

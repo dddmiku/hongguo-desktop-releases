@@ -91,11 +91,15 @@ def _from_latest_json(local):
     if not version:
         return {"ok": False, "error": "latest.json 里没有版本号",
                 "currentVersion": local, "page": PAGE_URL}
+    plat = (j.get("platforms") or {}).get("windows-x86_64") or {}
     return {
         "ok": True, "currentVersion": local, "latestVersion": version,
         "tag": "v" + version, "notes": str(j.get("notes") or "")[:4000],
         "publishedAt": str(j.get("pub_date") or ""), "page": PAGE_URL,
-        "assetName": "", "assetUrl": PAGE_URL, "assetSize": 0,
+        "assetName": "hongguo-%s-setup.exe" % version,
+        "assetUrl": str(plat.get("url") or PAGE_URL),
+        "assetSize": int(plat.get("size") or 0),
+        "sha256": str(j.get("sha256") or ""),
     }
 
 
@@ -160,6 +164,10 @@ def public():
         "assetUrl": r.get("assetUrl") or "",
         "assetName": r.get("assetName") or "",
         "assetSize": r.get("assetSize") or 0,
+        # 下载后要核对摘要。latest.json 里带 sha256（由发布脚本写入），
+        # Gitee / GitHub 都没有可靠的摘要接口，所以只能自己带。
+        "sha256": r.get("sha256") or "",
+        # 下载走哪个源由后端决定（Gitee 优先），前端不需要知道。
         "publishedAt": r.get("publishedAt") or "",
         "error": r.get("error") or "",
         "cached": bool(r.get("cached")),

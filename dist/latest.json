@@ -1,0 +1,12 @@
+{
+  "version": "1.1.0",
+  "sha256": "8feb5f6cf685efea079756c70f44a311533b5755e4ac2652b81ed0fd3bac460c",
+  "pub_date": "2026-10-08T02:09:46.362680Z",
+  "notes": "",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/dddmiku/hongguo-desktop-releases/releases/download/v1.1.0/hongguo-1.1.0-setup.exe",
+      "size": 103750465
+    }
+  }
+}

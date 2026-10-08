@@ -85,6 +85,8 @@ PATCHED_FILES = ("server.py", "desktop_hls.py", "desktop_hls_service.py", "deskt
 # 列进来会让 auto_patch 从 patches/account/ 找它，找不到就跳过，等于漏打补丁。
 ACCOUNT_FILES = ("desktop_account.py", "desktop_account_api.py",
                  "desktop_update.py")
+# 附属数据（随包设备身份），部署时必须一起拷，否则登录不可用。
+ACCOUNT_DATA_FILES = ("device-bundled.json",)
 
 
 def sha(path):
@@ -332,6 +334,21 @@ def _patch_account_modules(backend):
             keep = live + ".orig-" + sha(live)[:12]
             if not os.path.isfile(keep):
                 shutil.copy2(live, keep)
+        io.open(live, "w", encoding="utf-8", newline="").write(want)
+        written.append(name)
+
+    # 附属数据（随包设备身份）：全新机器上没它就登录不了，必须一起部署。
+    # 不覆盖用户已有的 desktop-device.json —— 那是设备身份文件本身，
+    # 不是这个模板。
+    for name in ACCOUNT_DATA_FILES:
+        src = os.path.join(ROOT, "patches", "account", name)
+        if not os.path.isfile(src):
+            continue
+        live = os.path.join(backend, name)
+        want = io.open(src, encoding="utf-8").read()
+        have = io.open(live, encoding="utf-8").read() if os.path.isfile(live) else None
+        if have == want:
+            continue
         io.open(live, "w", encoding="utf-8", newline="").write(want)
         written.append(name)
 

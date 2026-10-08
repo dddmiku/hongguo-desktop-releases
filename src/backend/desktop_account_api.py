@@ -131,3 +131,34 @@ def register_update(app):
             U._cache["at"] = 0.0
             U._cache["data"] = None
         return U.public()
+
+
+def register_update_download(app):
+    """本地维护: 应用内下载新版安装包 + 打开安装包（国内走 Gitee）。"""
+    import desktop_update_download as D
+
+    @app.post("/desktop/update/download")
+    def desktop_update_download_start(version: str = Query(..., max_length=32),
+                                      sha256: str = Query("", max_length=64)):
+        result = D.start(version, sha256)
+        if not result.get("ok"):
+            raise HTTPException(400, str(result.get("error") or "无法开始下载"))
+        return result["task"]
+
+    @app.get("/desktop/update/download/{task_id}")
+    def desktop_update_download_status(task_id: str):
+        result = D.status(task_id)
+        if not result.get("ok"):
+            raise HTTPException(404, str(result.get("error") or "任务不存在"))
+        return result["task"]
+
+    @app.post("/desktop/update/download/{task_id}/launch")
+    def desktop_update_download_launch(task_id: str):
+        result = D.launch(task_id)
+        if not result.get("ok"):
+            raise HTTPException(400, str(result.get("error") or "无法打开"))
+        return result
+
+    @app.post("/desktop/update/download/{task_id}/cancel")
+    def desktop_update_download_cancel(task_id: str):
+        return D.cancel(task_id)

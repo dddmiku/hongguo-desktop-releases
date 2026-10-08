@@ -165,8 +165,42 @@ def _session_ids():
     return data
 
 
+def _from_bundled():
+    """随安装包携带的设备身份。
+
+    为什么必须这么做（2026-10-08 实测 + 上游调查结论）：
+      红果的护照接口对 device_id / iid **两个字段一起**校验，未注册的随机值
+      直接 403 + 空 body（前端只看到「非 JSON 响应」）。而**离线注册一台新设备
+      是研究级难题**：
+        * 设备注册接口的签名校验 aid（红果 8662 vs 内置签名器 1967）对不上，
+          实测跨 app 签名被接受（HTTP 200）但返回 device_id=0；
+        * 红果新版 metasec 用 .msp_<sha1> 设备态存储，内容按设备上下文加密，
+          搬过来也解不开；fresh 注册要复现 metasec 的引导握手（网络+VM 保护 crypto）。
+      上游自己的做法也是「让真 app 注册一台，再 grab 它的设备参数入池」。
+      所以分发包直接带一台已注册的设备身份，装完即可用，用户什么都不用做。
+    设备身份不是账号凭据（不带 token/cookie），同一台设备多人登录互不影响；
+    文件缺失或校验失败时自动退回下面的流程。
+    """
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "device-bundled.json")
+        data = json.loads(io.open(path, encoding="utf-8").read())
+    except Exception:
+        return None
+    if not (isinstance(data, dict) and data.get("device_id") and data.get("iid")):
+        return None
+    data.setdefault("registered", True)
+    data.setdefault("source", "bundled")
+    return data
+
+
 def load_device():
-    """本机设备身份：一旦确定就固定下来，避免每次登录换设备。"""
+    """本机设备身份：一旦确定就固定下来，避免每次登录换设备。
+
+    优先级：环境变量 > 已存的本机文件 > 随包携带的 > 模拟器同步 > 随机兜底。
+    「随包携带」放在模拟器同步之前：普通用户没有模拟器，这是他们唯一
+    能自动拿到的合法设备身份。
+    """
     env = _from_env()
     if env:
         return env
@@ -176,6 +210,16 @@ def load_device():
             return data
     except Exception:
         pass
+    bundled = _from_bundled()
+    if bundled:
+        try:
+            os.makedirs(os.path.dirname(DEVICE_PATH), exist_ok=True)
+            io.open(DEVICE_PATH, "w", encoding="utf-8").write(
+                json.dumps(bundled, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+        log_event("device_bundled", note="使用随安装包携带的设备身份")
+        return bundled
     synced = _from_emulator()
     if synced:
         synced["registered"] = True
@@ -555,10 +599,9 @@ def _json(response):
 # 逐字段替换实验：device_id+iid 都换成已注册的 -> 200；只换其中一个 -> 403。
 # 所以必须两个字段同时是服务端注册过的。
 DEVICE_HINT = (
-    "本机没有可用的红果设备身份（device_id / iid），服务端拒绝了这次请求。"
-    "首次使用需要先获取设备身份：在模拟器（MuMu 等）里安装并登录红果，"
-    "然后点「从模拟器同步登录态」；或让提供安装包的人把 desktop-device.json "
-    "放到 %s 目录。"
+    "本机缺少随包携带的设备身份文件（device-bundled.json），"
+    "服务端因此拒绝了这次请求。请重新安装一次安装包（安装程序会把它放回 "
+    "%s 目录）；若仍不行，请把这个问题反馈给提供安装包的人。"
 )
 
 

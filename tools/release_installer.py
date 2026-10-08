@@ -10,6 +10,7 @@ token 从 git 凭据管理器取（不落盘、不进命令行、不打印）。
 """
 import argparse
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -135,6 +136,8 @@ def main():
     version = a.tag.lstrip("v")
     latest = {
         "version": version,
+        # 摘要：客户端下载完要核对（Gitee/GitHub 都没有可靠的摘要接口）
+        "sha256": hashlib.sha256(raw).hexdigest(),
         "notes": notes,
         "pub_date": datetime.datetime.now(datetime.timezone.utc)
                     .strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
