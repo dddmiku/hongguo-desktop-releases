@@ -33,6 +33,8 @@ final class SeriesDialog {
     private JSONArray episodes=new JSONArray();
     private volatile boolean dismissed;
     private boolean favoriteBusy;
+    private boolean favoriteKnown;
+    private boolean saved;
     private String intro="";
     private final Runnable updated=this::render;
     private SeriesDialog(TvActivity a,Api.Series s,LibraryRepository l){activity=a;series=s;library=l;intro=s.intro;}
@@ -44,6 +46,7 @@ final class SeriesDialog {
         dialog=new AlertDialog.Builder(activity).create();dialog.setView(page,0,0,0,0);dialog.setOnDismissListener(d->{dismissed=true;library.unobserve(updated);loader.shutdownNow();});dialog.show();
         if(dialog.getWindow()!=null){dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.getWindow().setLayout(dp(800),Math.min(dp(480),(int)(activity.getResources().getDisplayMetrics().heightPixels*.9f)));}
         library.observe(updated);render();
+        library.loadFavorite(series,result->{if(dismissed)return;favoriteKnown=result.known;saved=result.enabled;render();});
         loader.execute(()->{
             try{
                 Api api=new Api(activity);JSONObject response=api.episodes(series.seriesId);JSONArray rows=Api.parseEpisodes(response,series.seriesId);
@@ -66,14 +69,17 @@ final class SeriesDialog {
         List<List<View>> focus=new ArrayList<>();LinearLayout actions=TvUi.row(activity);actions.setPadding(0,dp(20),0,dp(22));List<View> buttons=new ArrayList<>();WatchRecord record=library.store().find(library.owner(),series.seriesId);
         if(record!=null){TextView resume=TvUi.button(activity,"继续第 "+record.episode+" 集 · "+TvUi.time(record.position),true,()->play(record.episode,record.position));resume.setTag("detail-resume");resume.setEnabled(episodes.length()>0);actions.addView(resume);buttons.add(resume);}
         TextView first=TvUi.button(activity,record==null?"立即播放":"从第一集看",record==null,()->play(1,0));first.setTag("detail-first");first.setEnabled(episodes.length()>0);TvUi.margins(first,activity,record!=null?12:0,0,12,0);actions.addView(first);buttons.add(first);
-        boolean saved=library.store().favorites(library.owner()).stream().anyMatch(s->s.seriesId.equals(series.seriesId));TextView favorite=TvUi.button(activity,saved?"已追剧":"加入追剧",false,()->favorite(!saved));favorite.setTag("detail-favorite");favorite.setEnabled(!favoriteBusy);actions.addView(favorite);buttons.add(favorite);body.addView(actions);focus.add(buttons);
+        TextView favorite=TvUi.button(activity,!favoriteKnown?"确认追剧状态":saved?"已追剧":"加入追剧",false,()->favorite(!saved));favorite.setTag("detail-favorite");favorite.setEnabled(!favoriteBusy);actions.addView(favorite);buttons.add(favorite);body.addView(actions);focus.add(buttons);
         TextView heading=TvUi.heading(activity,"选集",19);heading.setPadding(0,0,0,dp(12));body.addView(heading);
         for(int from=0;from<episodes.length();from+=10){LinearLayout row=TvUi.row(activity);List<View> cells=new ArrayList<>();for(int i=0;i<10;i++){JSONObject episode=episodes.optJSONObject(from+i);if(episode==null)break;int number=episode.optInt("num",from+i+1);TextView button=TvUi.tab(activity,String.format(java.util.Locale.US,"%02d",number),record!=null&&record.episode==number,()->play(number,0));button.setPadding(0,0,0,0);button.setTag("detail-ep:"+number);button.setContentDescription("播放第 "+number+" 集");LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(44),1);p.setMargins(0,0,dp(8),dp(8));row.addView(button,p);cells.add(button);}for(int i=cells.size();i<10;i++)row.addView(new View(activity),new LinearLayout.LayoutParams(0,1,1));body.addView(row);focus.add(cells);}
         TvFocus.linkRows(focus);if(tag!=null){View restored=body.findViewWithTag(tag);if(restored!=null)restored.requestFocus();}else if(episodes.length()>0&&!buttons.isEmpty())buttons.get(0).requestFocus();
     }
     private void favorite(boolean enabled){
         if(!Account.load(activity).loggedIn()){status.setText("登录后可以追剧，观看记录仍会保存在本机。");return;}
-        if(favoriteBusy)return;favoriteBusy=true;render();status.setText("正在更新追剧…");library.favorite(series,enabled,failure->{favoriteBusy=false;if(dismissed)return;status.setText(failure.isEmpty()?(enabled?"已加入追剧":"已取消追剧"):failure);render();});
+        if(favoriteBusy)return;
+        if(!favoriteKnown){favoriteBusy=true;status.setText("正在确认追剧状态…");library.loadFavorite(series,result->{favoriteBusy=false;if(dismissed)return;favoriteKnown=result.known;saved=result.enabled;status.setText(result.ok()?"追剧状态已确认":result.error);render();});return;}
+        favoriteBusy=true;render();status.setText("正在更新追剧…");
+        library.favorite(series,enabled,result->{favoriteBusy=false;if(dismissed)return;favoriteKnown=result.known;if(result.known)saved=result.enabled;status.setText(result.ok()?(result.enabled?"已加入追剧":"已取消追剧"):result.error);render();});
     }
     private void play(int episode,long position){
         int index=-1;for(int i=0;i<episodes.length();i++){JSONObject row=episodes.optJSONObject(i);if(row!=null&&row.optInt("num",i+1)==episode){index=i;break;}}

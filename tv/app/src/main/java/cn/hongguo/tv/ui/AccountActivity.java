@@ -59,6 +59,8 @@ public class AccountActivity extends TvActivity {
     private Button sendCodeBtn;
     private Button loginBtn;
     private TextView statusView;
+    private View accountBack;
+    private boolean loggedInUi;
 
     private cn.hongguo.tv.cache.LibraryRepository library;
     private final Runnable libraryUpdated=()->{if(!isDestroyed()&&cn.hongguo.tv.account.Account.load(this).loggedIn())loadLists();};
@@ -105,6 +107,10 @@ public class AccountActivity extends TvActivity {
         top.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
         Button back = new Button(this);
+        back.setTag("account-back");
+        back.setId(View.generateViewId());
+        back.setFocusableInTouchMode(true);
+        accountBack = back;
         back.setText("返回");
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         back.setAllCaps(false);
@@ -204,6 +210,10 @@ public class AccountActivity extends TvActivity {
      * @param target 0=手机号 1=验证码；<0 表示只显示、不切换目标
      */
     private void showKeypad(int target) {
+        if (Account.load(this).loggedIn() || loginForm.getVisibility() != View.VISIBLE) {
+            clearKeypad();
+            return;
+        }
         if (target >= 0) {
             selectKeypadTarget(target);
         }
@@ -211,26 +221,38 @@ public class AccountActivity extends TvActivity {
             return;
         }
         keypadShown = true;
+        keypadHost.animate().cancel();
         keypadHost.setVisibility(View.VISIBLE);
         keypadHost.setTranslationY(dp(240));
         keypadHost.animate().translationY(0).setDuration(160).start();
         if (pageSv != null) pageSv.setPadding(0, 0, 0, dp(KEYPAD_INSET_DP));
     }
 
-    /** 收起键盘，并把焦点交给手机号框（避免焦点落在消失的键盘上）。 */
+    /** Hide deterministically; focusing an EditText here would immediately reopen the keypad. */
     private void hideKeypad() {
-        if (!keypadShown) {
-            return;
-        }
+        boolean hadFocus = keypadHost.hasFocus();
+        clearKeypad();
+        if (!hadFocus) return;
+        if (Account.load(this).loggedIn()) focusAccountAction();
+        else if (loginBtn != null && loginBtn.isShown()) loginBtn.requestFocus();
+        else if (accountBack != null) accountBack.requestFocus();
+    }
+
+    private void clearKeypad() {
         keypadShown = false;
-        // 先把焦点移出键盘再隐藏，否则焦点会短暂落在不可见控件上，
-        // 遥控器方向键看起来「失灵」。
-        if (keypadHost.findFocus() != null && mobileInput != null) {
-            mobileInput.requestFocus();
+        if (keypadHost != null) {
+            keypadHost.animate().cancel();
+            keypadHost.clearFocus();
+            keypadHost.setVisibility(View.GONE);
+            keypadHost.setTranslationY(0);
         }
-        keypadHost.animate().translationY(dp(240)).setDuration(140)
-                .withEndAction(() -> keypadHost.setVisibility(View.GONE)).start();
         if (pageSv != null) pageSv.setPadding(0, 0, 0, 0);
+    }
+
+    private void focusAccountAction() {
+        View action = lists == null ? null : lists.findViewWithTag("account-history");
+        if (action != null && action.isShown()) action.requestFocus();
+        else if (accountBack != null) accountBack.requestFocus();
     }
 
     private void buildLoginForm() {
@@ -390,6 +412,7 @@ public class AccountActivity extends TvActivity {
             Account.save(this, cookie, "", uid, name, mobile);
             setStatus("导入成功");
             refresh();
+            library.sync(true);
         } catch (Throwable e) {
             setStatus("导入失败：格式不对（应是以 { 开头的 JSON）");
         }
@@ -399,12 +422,27 @@ public class AccountActivity extends TvActivity {
 
     private void refresh() {
         Account a = Account.load(this);
+        View focus = getCurrentFocus();
+        boolean moveFocus = a.loggedIn() && (!loggedInUi || isInside(focus, loginForm)
+                || isInside(focus, keypadHost));
+        loggedInUi = a.loggedIn();
         accountCard.removeAllViews();
         if (a.loggedIn()) {
             loginForm.setVisibility(View.GONE);
+            mobileInput.setFocusable(false);
+            codeInput.setFocusable(false);
+            mobileInput.clearFocus();
+            codeInput.clearFocus();
+            clearKeypad();
+            codeInput.setText("");
             accountCard.addView(loggedInCard(a));
             loadLists();
+            if (moveFocus) lists.post(() -> { if (!isDestroyed() && loggedInUi) focusAccountAction(); });
         } else {
+            mobileInput.setFocusable(true);
+            mobileInput.setFocusableInTouchMode(true);
+            codeInput.setFocusable(true);
+            codeInput.setFocusableInTouchMode(true);
             loginForm.setVisibility(View.VISIBLE);
             // 未登录不显示账号卡：一屏要放下表单 + 内置数字键盘，
             // 「未登录」这三个字不值得占掉一整行。
@@ -456,6 +494,9 @@ public class AccountActivity extends TvActivity {
         box.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
 
         Button logout = new Button(this);
+        logout.setTag("account-logout");
+        logout.setId(View.generateViewId());
+        logout.setFocusableInTouchMode(true);
         logout.setText("退出登录");
         logout.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         logout.setAllCaps(false);
@@ -671,6 +712,7 @@ public class AccountActivity extends TvActivity {
     }
 
     private void onKeypadKey(String label) {
+        if (Account.load(this).loggedIn() || !loginForm.isShown()) { clearKeypad(); return; }
         EditText target = keypadTarget == 0 ? mobileInput : codeInput;
         if (target == null) {
             return;
@@ -833,6 +875,7 @@ public class AccountActivity extends TvActivity {
                     runOnUiThread(() -> {
                         setStatus("登录成功");
                         refresh();
+                        library.sync(true);
                     });
                 } else {
                     JSONObject data2 = j.optJSONObject("data");
@@ -871,16 +914,26 @@ public class AccountActivity extends TvActivity {
 
     private void loadLists() {
         if(library==null||isDestroyed())return;
+        View focused=getCurrentFocus();Object tag=focused==null?null:focused.getTag();
+        boolean restore=isInside(focused,lists);
+        int scrollY=pageSv.getScrollY();
         lists.removeAllViews();
         TextView summary=TvUi.text(this,"本机保存 "+library.store().count(library.owner())+" 部观看记录 · "+(library.syncing()?"正在同步":"联网后自动同步"),15,TvUi.DIM);
         summary.setPadding(0,dp(18),0,dp(14));lists.addView(summary);
         LinearLayout entries=TvUi.row(this);
         TextView history=TvUi.button(this,"完整观看历史",false,()->startActivity(LibraryActivity.intent(this,false)));
+        history.setTag("account-history");
         entries.addView(history,new LinearLayout.LayoutParams(0,dp(44),1));
         TextView favorites=TvUi.button(this,"我的追剧",false,()->startActivity(LibraryActivity.intent(this,true)));
+        favorites.setTag("account-favorites");
         LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(44),1);p.setMargins(dp(12),0,0,0);entries.addView(favorites,p);
-        TextView sync=TvUi.button(this,"立即同步",true,()->library.sync(true));p=new LinearLayout.LayoutParams(0,dp(44),1);p.setMargins(dp(12),0,0,0);entries.addView(sync,p);lists.addView(entries);
+        TextView sync=TvUi.button(this,"立即同步",true,()->library.sync(true));sync.setTag("account-sync");p=new LinearLayout.LayoutParams(0,dp(44),1);p.setMargins(dp(12),0,0,0);entries.addView(sync,p);lists.addView(entries);
         if(!library.error().isEmpty()){TextView error=TvUi.text(this,library.error(),14,TvUi.ACCENT);error.setPadding(0,dp(12),0,0);lists.addView(error);}
+        TvFocus.linkRows(java.util.Collections.singletonList(java.util.Arrays.asList(history,favorites,sync)));
+        View logout=accountCard.findViewWithTag("account-logout");
+        for(View action:java.util.Arrays.asList(history,favorites,sync))action.setNextFocusUpId(logout==null?accountBack.getId():logout.getId());
+        if(logout!=null)logout.setNextFocusDownId(sync.getId());
+        if(restore&&tag!=null)lists.post(()->{if(isDestroyed())return;View action=lists.findViewWithTag(tag);if(action!=null)action.requestFocus();pageSv.scrollTo(0,scrollY);});
     }
 
     private View sectionTitle(String text, int count) {
@@ -1223,6 +1276,7 @@ public class AccountActivity extends TvActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        if(loginForm!=null)refresh();
         if(library!=null){library.observe(libraryUpdated);library.sync(false);}
         // 从「允许安装未知应用」授权页回来：已经下好包就接着装
         java.io.File apk = pendingApk;
@@ -1263,11 +1317,12 @@ public class AccountActivity extends TvActivity {
      *   这里改成「每次按键之后检查一次当前焦点落在哪」，只有焦点真的
      *   跑到键盘和输入框之外才收，判断稳定。
      */
-    @Override protected void onPause(){if(library!=null)library.unobserve(libraryUpdated);super.onPause();}
+    @Override protected void onPause(){clearKeypad();if(library!=null)library.unobserve(libraryUpdated);super.onPause();}
     @Override protected void onDestroy(){if(library!=null)library.unobserve(libraryUpdated);super.onDestroy();}
 
     @Override
     public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (keypadShown && Account.load(this).loggedIn()) { clearKeypad(); focusAccountAction(); }
         boolean handled = super.dispatchKeyEvent(event);
         if (event.getAction() == android.view.KeyEvent.ACTION_UP && keypadShown) {
             // 放到下一轮消息循环：此刻焦点可能还在切换过程中
@@ -1278,6 +1333,7 @@ public class AccountActivity extends TvActivity {
 
     /** 焦点若已离开键盘与输入框，收起键盘。 */
     private void autoHideKeypadIfLeft() {
+        if(Account.load(this).loggedIn()){clearKeypad();return;}
         if (!keypadShown) {
             return;
         }

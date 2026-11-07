@@ -134,9 +134,29 @@ public final class LibraryRepository {
 
     public void refreshFavorites(){sync(true);}
 
-    public void favorite(Api.Series series,boolean enabled,java.util.function.Consumer<String> done){
+    public void loadFavorite(Api.Series series,java.util.function.Consumer<cn.hongguo.tv.account.FavoriteSync.Result> done){
         Account snapshot=Account.load(context);
-        worker.execute(()->{String failure="";try{account.setFavorite(snapshot,series.seriesId,enabled);guard(snapshot);store.favorite(snapshot.libraryKey(),series,enabled);changed();}catch(Exception e){failure=friendly(e);}final String result=failure;ui.post(()->done.accept(result));});
+        if(!snapshot.loggedIn()){ui.post(()->done.accept(new cn.hongguo.tv.account.FavoriteSync.Result(true,false,"")));return;}
+        worker.execute(()->{
+            cn.hongguo.tv.account.FavoriteSync.Result result;
+            try{List<String> ids=account.favorites(snapshot);guard(snapshot);store.replaceFavorites(snapshot.libraryKey(),ids);result=new cn.hongguo.tv.account.FavoriteSync.Result(true,ids.contains(series.seriesId),"");}
+            catch(Exception e){result=new cn.hongguo.tv.account.FavoriteSync.Result(false,false,"暂时读不到追剧状态，请稍后重试");}
+            final cn.hongguo.tv.account.FavoriteSync.Result state=result;ui.post(()->done.accept(state));
+        });
+    }
+
+    public void favorite(Api.Series series,boolean enabled,java.util.function.Consumer<cn.hongguo.tv.account.FavoriteSync.Result> done){
+        Account snapshot=Account.load(context);
+        worker.execute(()->{
+            cn.hongguo.tv.account.FavoriteSync sync=new cn.hongguo.tv.account.FavoriteSync(new cn.hongguo.tv.account.FavoriteSync.Transport(){
+                public List<String> read()throws IOException{return account.favorites(snapshot);}
+                public void write(String sid,boolean target)throws IOException{account.setFavorite(snapshot,sid,target);}
+            });
+            cn.hongguo.tv.account.FavoriteSync.Result result=sync.update(series.seriesId,enabled);
+            try{guard(snapshot);if(result.known){store.favorite(snapshot.libraryKey(),series,result.enabled);changed();}}
+            catch(IOException e){result=new cn.hongguo.tv.account.FavoriteSync.Result(false,false,friendly(e));}
+            final cn.hongguo.tv.account.FavoriteSync.Result state=result;ui.post(()->done.accept(state));
+        });
     }
     private static String friendly(Exception e){String text=e.getMessage();return text==null||text.trim().isEmpty()?"连接暂时不可用，本机记录仍可查看":text;}
 }

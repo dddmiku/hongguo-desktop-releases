@@ -706,11 +706,13 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
             return;
         }
         if(favoriteBusy)return;
+        if(!favoriteKnown){loadFavoriteState();setStatus("正在确认追剧状态…");return;}
         favoriteBusy=true;
+        updateFavoriteLabel();
         final boolean target = !favorited;
         setStatus(target ? "正在加入收藏…" : "正在取消收藏…");
         Api.Series item=new Api.Series();item.seriesId=seriesId;item.title=seriesTitle;item.cover=seriesCover;item.episodeCount=episodes.size();
-        library.favorite(item,target,failure->{favoriteBusy=false;if(isDestroyed())return;if(failure.isEmpty()){favorited=target;favoriteKnown=true;updateFavoriteLabel();setStatus(target?"已加入追剧":"已取消追剧");}else setStatus(failure);});
+        library.favorite(item,target,result->{favoriteBusy=false;if(isDestroyed())return;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();setStatus(result.ok()?(result.enabled?"已加入追剧":"已取消追剧"):result.error);});
     }
 
     /** 读一次云端书架，确定当前剧是否已收藏。失败保持「收藏」文案（不谎报已收藏）。 */
@@ -721,23 +723,18 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
             ui.post(this::updateFavoriteLabel);
             return;
         }
-        new Thread(() -> {
-            try {
-                List<String> ids = account.favorites();
-                favorited = ids != null && ids.contains(seriesId);
-                favoriteKnown = true;
-                ui.post(this::updateFavoriteLabel);
-            } catch (Throwable e) {
-                Log.d(TAG, "读取收藏状态失败（忽略）: " + e.getMessage());
-            }
-        }, "favorite-state").start();
+        if(favoriteBusy)return;
+        favoriteBusy=true;updateFavoriteLabel();
+        Api.Series item=new Api.Series();item.seriesId=seriesId;
+        library.loadFavorite(item,result->{if(isDestroyed())return;favoriteBusy=false;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();});
     }
 
     private void updateFavoriteLabel() {
         if (favView == null) {
             return;
         }
-        favView.setText(favorited ? "已收藏" : "收藏");
+        favView.setText(favoriteBusy?"确认中…":!favoriteKnown?"重试追剧状态":favorited?"已追剧":"追剧");
+        favView.setEnabled(!favoriteBusy);
         GradientDrawable g = new GradientDrawable();
         g.setCornerRadius(dp(4));
         // 已收藏用品牌红，未收藏用中性灰 —— 一眼能看出状态

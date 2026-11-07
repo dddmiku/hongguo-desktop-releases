@@ -258,9 +258,7 @@ public final class AccountApi {
             // 101144 是书架写接口的冷却（「追剧失败，请稍后再试」）。
             // 原样把上游文案抛给用户没有指导意义，而且反复点会续期冷却，
             // 所以这里换成能指导操作的提示。
-            if (code == 101144) {
-                throw new IOException("操作太频繁，请过几分钟再试");
-            }
+            if (code == 101144) throw new IOException("追剧暂时未成功，请稍后重试（101144）");
             throw new IOException(errText(j));
         }
         return true;
@@ -283,13 +281,9 @@ public final class AccountApi {
         }
         List<String> out = new ArrayList<>();
         JSONObject data = j.optJSONObject("data");
-        if (data == null) {
-            return out;
-        }
+        if (data == null) throw new IOException("追剧状态格式异常，原记录已保留");
         JSONArray arr = data.optJSONArray("video_shelf_info");
-        if (arr == null) {
-            return out;
-        }
+        if (arr == null) throw new IOException("追剧状态格式异常，原记录已保留");
         for (int i = 0; i < arr.length(); i++) {
             JSONObject o = arr.optJSONObject(i);
             if (o == null) {
@@ -529,9 +523,11 @@ public final class AccountApi {
         String url = contentUrl(path, null);
         Map<String, String> h = contentHeaders(a);
         h.put("content-type", "application/json; charset=utf-8");
-        byte[] raw = body.toString().getBytes("UTF-8");
+        ContentBody requestBody=new ContentBody(body);
+        h.put("content-encoding","gzip");
+        h.put("x-ss-stub",requestBody.digest);
         h.putAll(signer.sign(url, h));
-        Http.Response r = Http.post(url, h, raw, null);
+        Http.Response r = Http.post(url, h, requestBody.bytes, null);
         if (!r.ok()) {
             throw new IOException("接口无响应（HTTP " + r.code + "）");
         }
@@ -546,6 +542,7 @@ public final class AccountApi {
         Map<String, String> h = new LinkedHashMap<>();
         h.put("user-agent", PASSPORT_UA);
         h.put("accept", "application/json");
+        h.put("Accept-Encoding", "identity");
         if (a != null && a.loggedIn()) {
             if (!a.cookie.isEmpty()) {
                 h.put("cookie", a.cookie);

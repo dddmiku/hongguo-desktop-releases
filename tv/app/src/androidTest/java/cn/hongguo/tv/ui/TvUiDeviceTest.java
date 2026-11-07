@@ -18,7 +18,7 @@ import cn.hongguo.tv.cache.WatchRecord;
 /** Genuine content and decoder QA runs in the separate, logged-out .qa application. */
 public class TvUiDeviceTest extends InstrumentationTestCase {
     private Activity activity;
-    @Override protected void setUp() throws Exception {super.setUp();assertTrue(getInstrumentation().getTargetContext().getPackageName().endsWith(".qa"));}
+    @Override protected void setUp() throws Exception {super.setUp();assertTrue(getInstrumentation().getTargetContext().getPackageName().endsWith(".qa"));cn.hongguo.tv.account.Account.clear(getInstrumentation().getTargetContext());}
     @Override protected void tearDown() throws Exception {if(activity!=null)main(()->{activity.finish();return null;});super.tearDown();}
     private <T>T main(Supplier<T> task){AtomicReference<T> value=new AtomicReference<>();getInstrumentation().runOnMainSync(()->value.set(task.get()));return value.get();}
     private void waitFor(String label,Supplier<Boolean> check,long timeout)throws Exception{long deadline=System.currentTimeMillis()+timeout;while(System.currentTimeMillis()<deadline){if(main(check))return;Thread.sleep(100);}fail(label);}
