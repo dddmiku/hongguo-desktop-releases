@@ -1,0 +1,140 @@
+// TV 端构建配置。
+//
+// 设计取向：包体尽量小、依赖尽量少。
+//   - 不引 AndroidX（用系统 View + 手写焦点导航），省 ~2MB
+//   - 不引 OkHttp（用 HttpsURLConnection），省 ~1.5MB
+//   - 不引 Kotlin 运行时（纯 Java），省 ~1.4MB
+// 唯一必需的第三方是 JNA，用来调签名 so。
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'cn.hongguo.tv'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "cn.hongguo.tv"
+        minSdk 24
+        targetSdk 33
+        testInstrumentationRunner "android.test.InstrumentationTestRunner"
+        // TV 端有独立的版本线：桌面端已经到 1.9.x，两边功能集完全不同，
+        // 混用同一个版本号会让更新检测永远提示「有新版本」。
+        // 用纯数字版本号，避免 compare() 把后缀解析成 0 造成的歧义。
+        // 1.0.2：首页改单行顶栏（账号入口在右上角）+ 焦点框不再缩放
+        // + 卡片高度统一 + 账号登录/收藏/历史同步
+        // 1.0.3：收藏页补真实封面/标题（批量取剧集元数据）+ 播放页加收藏键(F)
+        // + 云端历史带封面
+        // 1.0.4：修复非首页入口签名器未初始化（收藏/历史全空）+ 历史字段名
+        // data_list + 收藏冷却提示
+        // 1.0.5：修复换号发码带旧账号 cookie + 错误码 7/1206 给出可操作提示
+        // + 检查更新防连点、账号页补全下载安装链路、已下载不重复下载
+        // 1.0.6：安装成功/启动时清理已下载的安装包；进程被杀后重启也能
+        // 复用已下载的包；账号页加「从电脑版导入登录」
+        // 1.0.7：首页顶栏加独立的「更新」按钮（不依赖登录态）+ 启动自动
+        // 检测更新（每天一次，有新版本标红提示）
+        // 1.0.8：修复护照登录恒 error_code=7（device_id/iid/cdid 三个值串位）
+        // + 内置数字键盘（遥控器直接输手机号/验证码）+ Accept-Encoding 参与签名
+        // 1.0.9：数字键盘改为按需弹出（聚焦输入框/点「输入号码」才显示，
+        // 焦点离开自动收起，另有显式「收起」按钮）
+        versionCode 11
+        versionName "1.1.0"
+
+
+        ndk {
+            // 只打 arm 架构：电视/盒子全是 ARM，x86 模拟器不支持签名 so。
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    signingConfigs {
+        // release 签名。
+        //
+        // keystore 不进 git（见 .gitignore），但路径和口令写在
+        // keystore.properties 里 —— 那是本机构建配置，也不进 git。
+        // 两者都缺失时 release 构建会明确报错，而不是静默降级成
+        // debug 签名（那样发出去的包以后无法覆盖升级）。
+        release {
+            def propsFile = rootProject.file('keystore.properties')
+            if (propsFile.exists()) {
+                def props = new Properties()
+                propsFile.withInputStream { props.load(it) }
+                storeFile rootProject.file(props.storeFile)
+                storePassword props.storePassword
+                keyAlias props.keyAlias
+                keyPassword props.keyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
+            def propsFile = rootProject.file('keystore.properties')
+            if (propsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            minifyEnabled false
+            applicationIdSuffix ".qa"
+            versionNameSuffix "-qa"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // JNA 的 so 必须保持原样，不能被压缩（运行时按路径加载）。
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    // 产物文件名。
+    //
+    // 默认名是 app-release.apk —— 从文件名看不出是哪个应用、哪个版本，
+    // 下载到一堆 APK 里根本分不清。带上应用名和版本号：
+    //   release → hongguo-tv-1.0.1.apk
+    //   debug   → hongguo-tv-1.0.1-debug.apk（保留后缀，避免和 release 撞名）
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            def name = "hongguo-tv-${variant.versionName}"
+            if (variant.buildType.name != 'release') {
+                name += "-${variant.buildType.name}"
+            }
+            output.outputFileName = "${name}.apk"
+        }
+    }
+}
+
+dependencies {
+    androidTestImplementation files("${android.sdkDirectory}/platforms/android-33/optional/android.test.runner.jar", "${android.sdkDirectory}/platforms/android-33/optional/android.test.base.jar")
+    // JNA：唯一必需依赖，用于调用签名 so 里的固定偏移函数。
+    //
+    // 用 @aar 会带进 JNA 自带的 libjnidispatch.so，与我们随包的
+    // libhongguo_jnidispatch.so 冲突（两份同功能 so，浪费 290KB）。
+    // 这里用普通 jar + 显式排除 native，dispatch 只保留我们自己那份。
+    implementation('net.java.dev.jna:jna:5.13.0') {
+        exclude group: 'net.java.dev.jna', module: 'jna-platform'
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    if (graph.allTasks.any { it.project == project && it.name in ['assembleRelease', 'packageRelease', 'bundleRelease'] }
+            && !rootProject.file('keystore.properties').isFile()) {
+        throw new GradleException('正式 TV 安装包需要原 keystore.properties 与签名密钥；调试验收请构建 Debug。')
+    }
+}

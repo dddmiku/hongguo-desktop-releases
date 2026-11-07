@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider 配置：把缓存目录下的 APK 暴露给系统安装器。
+
+    为什么必须有：
+      Android 7+ 禁止用 file:// URI 跨应用传文件（FileUriExposedException）。
+      安装 APK 必须走 content:// URI，而 content:// 需要声明一个 FileProvider。
+      这是应用内更新的硬性前提，缺了会在安装那一步直接崩。
+-->
+<paths>
+    <!-- 下载的 APK 放这里 -->
+    <cache-path name="updates" path="updates/" />
+    <files-path name="files" path="." />
+</paths>

@@ -1,0 +1,13 @@
+* text=auto
+*.java text eol=lf
+*.md text eol=lf
+*.xml text eol=lf
+*.gradle text eol=lf
+*.properties text eol=lf
+*.py text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.so binary
+*.png binary
+*.bin binary
+*.json text eol=lf

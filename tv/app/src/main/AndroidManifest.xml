@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 应用内更新需要安装 APK。Android 8+ 还要用户在设置里手动允许。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!--
+        电视/盒子没有触摸屏，声明为非必需以免被 Play 商店按「需要触摸屏」过滤。
+        这两条是 TV 应用的标准声明，缺了会导致电视上搜不到应用。
+    -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <!-- 电视必须有方向键导航能力；没有方向键的设备跑不了这个应用 -->
+    <uses-feature
+        android:name="android.hardware.gamepad"
+        android:required="false" />
+
+    <!--
+        图标和 banner 必须是**位图**（PNG），不能用 <shape> 矢量。
+
+        为什么：系统安装器（PackageInstallerActivity.startInstall）会把
+        launcher 图标的 Drawable 转成 Bitmap 塞进 AppSnippet 的 Parcel。
+        <shape> 的固有尺寸是 -1×-1，转 Bitmap 时抛
+        IllegalArgumentException: width and height must be > 0 —— 表现是
+        「点更新后安装器一闪就退，应用没升级」，且不弹任何错误提示。
+        真机和模拟器都会踩到，不是环境问题。
+
+    -->
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/banner"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:supportsRtl="false"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="false">
+
+        <!--
+            LEANBACK_LAUNCHER 和 LAUNCHER 必须放在**两个独立的** intent-filter 里。
+
+            为什么：Android 的 intent-filter 是「所有条件与」匹配。写在同一个
+            filter 里时，需要 action MAIN + 两个 category 同时成立，而实际
+            Intent 只带其中一个 category，结果两边都匹配不上 —— 电视桌面和
+            手机桌面都看不到图标。这是 TV 应用最常见的清单错误。
+        -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            应用内更新的 APK 分发 Provider。
+            Android 7+ 不能用 file:// 跨应用传文件，安装 APK 必须走
+            content://。项目不引 AndroidX，所以自带一个极简实现。
+            exported=false + grantUriPermissions 让它只能被我们主动授权。
+        -->
+        <provider
+            android:name=".update.ApkProvider"
+            android:authorities="${applicationId}.apk"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <activity
+            android:name=".ui.SearchActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:theme="@style/AppTheme" />
+
+        <activity
+            android:name=".ui.AccountActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/AppTheme" />
+
+        <activity
+            android:name=".ui.LibraryActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:theme="@style/AppTheme" />
+
+        <activity
+            android:name=".ui.PlayerActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:theme="@style/AppTheme" />
+    </application>
+</manifest>
