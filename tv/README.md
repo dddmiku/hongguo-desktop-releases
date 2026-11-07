@@ -18,7 +18,7 @@ Android TV / 电视盒子客户端。1.1.0 接手原 TV 项目，沿用 `cn.hong
 gradle :app:assembleRelease
 ```
 
-Gradle 产物在 `app/build/outputs/apk/release/hongguo-tv-1.1.1.apk`。正式签名使用本机 `keystore.properties` 和 `keystore/hongguo-tv.jks`，均排除在源码仓库之外。不要换签名或先卸载旧版。
+Gradle 产物在 `app/build/outputs/apk/release/hongguo-tv-1.1.2.apk`。正式签名使用本机 `keystore.properties` 和 `keystore/hongguo-tv.jks`，均排除在源码仓库之外。不要换签名或先卸载旧版。
 
 安装包、入口图标和 TV banner 必须是 PNG；系统安装器不能使用固有尺寸无效的 shape 图标。LEANBACK_LAUNCHER 与 LAUNCHER 保持独立 intent-filter。签名上下文由 Application 统一初始化，直接启动账号、历史或播放器也可使用。
 
@@ -26,13 +26,11 @@ Gradle 产物在 `app/build/outputs/apk/release/hongguo-tv-1.1.1.apk`。正式�
 
 ```powershell
 gradle :app:assembleDebug :app:assembleDebugAndroidTest
-adb install -r app/build/outputs/apk/debug/hongguo-tv-1.1.1-qa-debug.apk
-adb install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-adb shell am instrument -w cn.hongguo.tv.qa.test/android.test.InstrumentationTestRunner
+python tools/verify-player-lifecycle.py --install --full
 python -m unittest discover -s tools -p test_publish.py
 ```
 
-`.qa` 使用独立应用 ID 与数据，不操作已安装正式版的账号。设备测试包含真实 SQLite 1500 条分页、搜索、账号隔离、进度冲突、过期确认、删除隐藏，以及真实内容、遥控器焦点、解码播放、暂停与精确续播。
+`.qa` 使用独立应用 ID 与数据，不操作已安装正式版的账号。设备测试包含真实 SQLite 1500 条分页、搜索、账号隔离、进度冲突、过期确认、删除隐藏，以及真实内容、遥控器焦点、解码播放、暂停与精确续播。新增返回首页、历史、追剧时的延迟取流失败回归、空剧集退出和九轮实际解码返回验收。单独复现生命周期用 `python tools/verify-player-lifecycle.py --install`；报告只覆盖写到 `_work/crash-qa/`。
 
 ## 发布
 
@@ -42,7 +40,7 @@ python -m unittest discover -s tools -p test_publish.py
 python tools/publish.py --source-commit <已推送的40位源码提交>
 ```
 
-TV Release 标签为 `tv-v1.1.1`，安装资产使用 `hongguo-tv-1.1.1.APK`。发布器先上传草稿并核对资产大小和 SHA-256，再公开。已公开版本不替换资产；发现修复应递增版本号。
+TV Release 标签为 `tv-v1.1.2`，安装资产使用 `hongguo-tv-1.1.2.APK`。发布器先上传草稿并核对资产大小和 SHA-256，再公开。已公开版本不替换资产；发现修复应递增版本号。
 
 更新清单继承原 PC 平台、兼容迁移字段和顶层版本，只更新 `platforms.android-tv`。TV 自己的版本不与 PC 或旧兼容桥编号比较。后续 PC 发布继续继承线上 TV 平台，避免冲掉电视更新入口。
 

@@ -85,7 +85,6 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     private boolean prepared;
     private boolean surfaceReady;
     private File pendingFile;
-    private long pendingSeek;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -104,7 +103,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     private String seriesTitle;
     private final List<Ep> episodes = new ArrayList<>();
     private int index;
-    private int loadGeneration;
+    private volatile int loadGeneration;
     private cn.hongguo.tv.cache.LibraryRepository library;
     private String playbackOwner;
     private long requestedStartPosition=-1;
@@ -112,6 +111,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     private boolean autoplay=true;
     private boolean foreground;
     private android.app.AlertDialog playbackMenu;
+    private android.app.AlertDialog episodePicker;
 
 
     /** 当前清晰度上限，用于切换。 */
@@ -127,6 +127,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     private final Runnable saveTick = new Runnable() {
         @Override
         public void run() {
+            if (!foreground || isFinishing() || isDestroyed()) return;
             saveProgress();
             ui.postDelayed(this, SAVE_INTERVAL_MS);
         }
@@ -330,7 +331,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     // ------------------------------------------------------------ 播放控制
 
     private void play(int i) {
-        if (i < 0 || i >= episodes.size()) {
+        if (!playbackUiActive() || i < 0 || i >= episodes.size()) {
             return;
         }
         // 切集前先存当前进度，否则切走后进度丢失
@@ -350,53 +351,73 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
                 JSONObject j = api.videoModel(ep.vid);
                 JSONObject vm = Api.findVideoModel(j, ep.vid);
                 if (vm == null) {
-                    fail("取流失败");
+                    postLoad(request, () -> fail("取流失败"));
                     return;
                 }
                 TrackPicker.Track t = TrackPicker.pick(vm, cap);
                 Log.i(TAG, "第 " + ep.num + " 集 选中 " + t);
-                if(request!=loadGeneration||isDestroyed())return;
-                actualDefinition = t.definition;
-                ui.post(() -> {if(request==loadGeneration&&!isDestroyed())updateQualityLabel();});
+                if (request != loadGeneration) return;
+                postLoad(request, () -> {
+                    actualDefinition = t.definition;
+                    updateQualityLabel();
+                });
                 // 缓存键要带清晰度，否则换档会命中旧档的文件
                 String bucket = t.definition;
                 preparer.prepare(ep.vid, bucket, t.mainUrl, t.spadeA,
                         t.encrypted, new EpisodePreparer.Listener() {
                             @Override
                             public void onProgress(String stage, int pct) {
-                                ui.post(() -> {if(request==loadGeneration&&!isDestroyed())setStatus("第 " + ep.num + " 集 "
-                                        + stage + (pct > 0 && pct < 100 ? " " + pct + "%" : ""));});
+                                postLoad(request, () -> setStatus("第 " + ep.num + " 集 "
+                                        + stage + (pct > 0 && pct < 100 ? " " + pct + "%" : "")));
                             }
 
                             @Override
                             public void onDone(File plain) {
-                                ui.post(() -> {if(request==loadGeneration&&!isDestroyed())startPlayback(plain,ep.num);});
+                                postLoad(request, () -> startPlayback(plain, ep.num));
                             }
 
                             @Override
                             public void onError(String message) {
-                                ui.post(() -> {if(request==loadGeneration&&!isDestroyed())fail(message);});
+                                postLoad(request, () -> fail(message));
                             }
                         });
             } catch (Throwable e) {
                 Log.e(TAG, "取流异常", e);
-                if(request==loadGeneration&&!isDestroyed())fail(String.valueOf(e.getMessage()));
+                String message = e.getMessage();
+                postLoad(request, () -> fail(message == null || message.isEmpty() ? "取流失败，请稍后重试" : message));
             }
         }, "episode-load").start();
     }
 
+    /** Check lifetime and request generation together on the same thread that owns the views. */
+    private void postLoad(int request, Runnable action) {
+        ui.post(() -> {
+            if (request == loadGeneration && playbackUiActive()) action.run();
+        });
+    }
+
+    private boolean playbackUiActive() {
+        return status != null && !isFinishing() && !isDestroyed();
+    }
+
+    private boolean currentPlayer(MediaPlayer candidate, int request) {
+        return candidate == player && request == loadGeneration && playbackUiActive();
+    }
+
     private void startPlayback(File f, int epNum) {
+        if (!playbackUiActive()) return;
         if (!surfaceReady) {
             pendingFile = f;
-            pendingSeek = -1;
             return;
         }
         releasePlayer();
+        final int request = loadGeneration;
         try {
             player = new MediaPlayer();
             player.setDisplay(surface.getHolder());
             player.setDataSource(f.getAbsolutePath());
             player.setOnVideoSizeChangedListener((mp, w, h) -> {
+                if (!currentPlayer(mp, request)) return;
                 // 按视频真实宽高比调整 Surface，不做拉伸。
                 //
                 // 红果的短剧原始素材是竖屏 9:16，但上游把它装进 16:9 容器
@@ -406,6 +427,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
                 applyAspect(w, h);
             });
             player.setOnPreparedListener(mp -> {
+                if (!currentPlayer(mp, request)) return;
                 prepared = true;
                 // 续播：同一集重进时回到上次位置
                 long dur = mp.getDuration();
@@ -420,7 +442,9 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
                 scheduleHideOverlay();
             });
             player.setOnCompletionListener(mp -> {
+                if (!currentPlayer(mp, request)) return;
                 flushProgress();
+                if (!foreground) return;
                 if (autoplay && index + 1 < episodes.size()) {
                     play(index + 1);
                 } else {
@@ -429,6 +453,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
                 }
             });
             player.setOnErrorListener((mp, what, extra) -> {
+                if (!currentPlayer(mp, request)) return true;
                 Log.e(TAG, "MediaPlayer 错误 what=" + what + " extra=" + extra);
                 fail("播放失败（" + what + "/" + extra + "）");
                 return true;
@@ -635,20 +660,23 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     }
 
     private void setStatus(String s) {
+        if (!playbackUiActive()) return;
         status.setText(s);
         Log.i(TAG, s);
     }
 
     private void releasePlayer() {
         prepared = false;
+        pendingFile = null;
         ui.removeCallbacks(ticker);
-        if (player != null) {
-            try {
-                player.stop();
-            } catch (Throwable ignored) {
-            }
-            player.release();
-            player = null;
+        MediaPlayer previous = player;
+        player = null;
+        if (previous != null) {
+            previous.setOnPreparedListener(null);
+            previous.setOnCompletionListener(null);
+            previous.setOnErrorListener(null);
+            previous.setOnVideoSizeChangedListener(null);
+            previous.release();
         }
     }
 
@@ -712,7 +740,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
         final boolean target = !favorited;
         setStatus(target ? "正在加入收藏…" : "正在取消收藏…");
         Api.Series item=new Api.Series();item.seriesId=seriesId;item.title=seriesTitle;item.cover=seriesCover;item.episodeCount=episodes.size();
-        library.favorite(item,target,result->{favoriteBusy=false;if(isDestroyed())return;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();setStatus(result.ok()?(result.enabled?"已加入追剧":"已取消追剧"):result.error);});
+        library.favorite(item,target,result->{if(!playbackUiActive())return;favoriteBusy=false;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();setStatus(result.ok()?(result.enabled?"已加入追剧":"已取消追剧"):result.error);});
     }
 
     /** 读一次云端书架，确定当前剧是否已收藏。失败保持「收藏」文案（不谎报已收藏）。 */
@@ -726,11 +754,11 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
         if(favoriteBusy)return;
         favoriteBusy=true;updateFavoriteLabel();
         Api.Series item=new Api.Series();item.seriesId=seriesId;
-        library.loadFavorite(item,result->{if(isDestroyed())return;favoriteBusy=false;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();});
+        library.loadFavorite(item,result->{if(!playbackUiActive())return;favoriteBusy=false;favoriteKnown=result.known;if(result.known)favorited=result.enabled;updateFavoriteLabel();});
     }
 
     private void updateFavoriteLabel() {
-        if (favView == null) {
+        if (favView == null || isFinishing() || isDestroyed()) {
             return;
         }
         favView.setText(favoriteBusy?"确认中…":!favoriteKnown?"重试追剧状态":favorited?"已追剧":"追剧");
@@ -786,13 +814,15 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
     }
 
     private void showPlaybackMenu(){
+        if (!playbackUiActive()) return;
         if(playbackMenu!=null&&playbackMenu.isShowing())return;
         String[] items={"选集 · 当前第 "+episodes.get(index).num+" 集","清晰度 · "+(actualDefinition.isEmpty()?CAP_NAMES[capIndex]:actualDefinition),"倍速 · "+trimSpeed()+"×","画面 · "+MODE_NAMES[aspectMode],autoplay?"关闭自动连播":"开启自动连播",favorited?"取消追剧":"加入追剧"};
         playbackMenu=new android.app.AlertDialog.Builder(this).setTitle("播放设置").setItems(items,(d,which)->{switch(which){case 0:showEpisodePicker();break;case 1:cycleQuality();break;case 2:cycleSpeed();break;case 3:cycleAspect();break;case 4:autoplay=!autoplay;getPreferences(0).edit().putBoolean("autoplay",autoplay).apply();setStatus(autoplay?"自动连播已开启":"自动连播已关闭");break;case 5:toggleFavorite();break;}}).setNegativeButton("返回播放",null).show();
     }
     private void showEpisodePicker(){
+        if (!playbackUiActive() || episodePicker != null && episodePicker.isShowing()) return;
         String[] labels=new String[episodes.size()];for(int i=0;i<labels.length;i++)labels[i]="第 "+episodes.get(i).num+" 集";
-        new android.app.AlertDialog.Builder(this).setTitle("选集").setSingleChoiceItems(labels,index,(d,which)->{d.dismiss();requestedStartPosition=0;play(which);}).setNegativeButton("返回播放",null).show();
+        episodePicker=new android.app.AlertDialog.Builder(this).setTitle("选集").setSingleChoiceItems(labels,index,(d,which)->{d.dismiss();requestedStartPosition=0;play(which);}).setNegativeButton("返回播放",null).show();
     }
 
     private void togglePause() {
@@ -836,6 +866,7 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        if (!playbackUiActive()) return;
         surfaceReady = true;
         if (pendingFile != null) {
             File f = pendingFile;
@@ -861,6 +892,8 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
         super.onPause();
         flushProgress();
         ui.removeCallbacks(saveTick);
+        ui.removeCallbacks(ticker);
+        ui.removeCallbacks(hideOverlay);
         if (player != null && prepared) {
             try {
                 player.pause();
@@ -874,18 +907,23 @@ public class PlayerActivity extends TvActivity implements SurfaceHolder.Callback
         super.onResume();
         foreground=true;
         if(library!=null&&!playbackOwner.equals(library.owner())){finish();return;}
+        ui.removeCallbacks(saveTick);
         ui.postDelayed(saveTick, SAVE_INTERVAL_MS);
+        if (player != null && prepared) startTicker();
     }
 
     @Override
     protected void onDestroy() {
         loadGeneration++;
-        super.onDestroy();
+        foreground = false;
         flushProgress();
-        ui.removeCallbacks(saveTick);
-        ui.removeCallbacks(ticker);
+        ui.removeCallbacksAndMessages(null);
+        if (overlay != null) overlay.animate().cancel();
+        if (playbackMenu != null) playbackMenu.dismiss();
+        if (episodePicker != null) episodePicker.dismiss();
         releasePlayer();
-        new Thread(() -> cache.trim(), "cache-trim").start();
+        if (cache != null) new Thread(() -> cache.trim(), "cache-trim").start();
+        super.onDestroy();
     }
 
     // ------------------------------------------------------------ 入参

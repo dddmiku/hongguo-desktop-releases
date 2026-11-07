@@ -37,8 +37,8 @@ android {
         // + 内置数字键盘（遥控器直接输手机号/验证码）+ Accept-Encoding 参与签名
         // 1.0.9：数字键盘改为按需弹出（聚焦输入框/点「输入号码」才显示，
         // 焦点离开自动收起，另有显式「收起」按钮）
-        versionCode 12
-        versionName "1.1.1"
+        versionCode 13
+        versionName "1.1.2"
 
 
         ndk {
